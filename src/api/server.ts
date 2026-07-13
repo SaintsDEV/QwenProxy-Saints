@@ -15,6 +15,8 @@ import { responsesApp } from "../routes/responses/index.js";
 import { sendOpenAIError } from "./error-helpers.js";
 import { AuthError, NotFoundError } from "../core/errors.js";
 import type { QwenAccount } from "../core/accounts.js";
+import { adminApp } from "./admin.js";
+import { dashboardHtml } from "../dashboard/page.js";
 
 // Module-level state (initialized in startServer)
 let cache: MemoryCache | undefined;
@@ -95,6 +97,18 @@ app.route("", anthropicApp);
 
 // OpenAI Responses API compatible routes
 app.route("", responsesApp);
+
+// Local management application. Set ADMIN_TOKEN to require X-Admin-Token on
+// programmatic admin calls when exposing the proxy beyond localhost.
+app.use("/api/admin/*", async (c, next) => {
+  const expected = process.env.ADMIN_TOKEN;
+  if (expected && c.req.header("X-Admin-Token") !== expected) {
+    return c.json({ error: "Token administrativo inválido" }, 401);
+  }
+  await next();
+});
+app.route("", adminApp);
+app.get("/", (c) => c.html(dashboardHtml));
 
 app.get("/health", async (c) => {
   const status = await watchdog?.getStatus();

@@ -159,7 +159,11 @@ export function addAccount(
 
 export function removeAccount(id: string): boolean {
   const db = getDatabase();
-  const result = db.prepare("DELETE FROM accounts WHERE id = ?").run(id);
+  const remove = db.transaction(() => {
+    db.prepare("DELETE FROM qwen_auth_sessions WHERE account_id = ?").run(id);
+    return db.prepare("DELETE FROM accounts WHERE id = ?").run(id);
+  });
+  const result = remove();
   invalidateAccountsCache();
   return result.changes > 0;
 }

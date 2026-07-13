@@ -23,7 +23,10 @@ import {
   getAccountCooldownInfo,
   clearAccountCooldown,
 } from "../../core/account-manager.ts";
-import { loadAccounts } from "../../core/accounts.ts";
+import {
+  getAccountCredentials,
+  loadAccounts,
+} from "../../core/accounts.ts";
 import { registerStream, removeStream } from "../../core/stream-registry.ts";
 import {
   logger,
@@ -33,6 +36,7 @@ import {
 import { config } from "../../core/config.ts";
 import { UpstreamRateLimit } from "../../core/errors.ts";
 import { QwenFileEntry } from "../upload.ts";
+import { ensureAccountForRateLimit } from "../../services/auto-account-creator.ts";
 
 // Per-chat lock: serializes requests to the same Qwen chat session
 const chatLocks = new Map<string, Mutex>();
@@ -162,7 +166,11 @@ function isAccountUnavailableError(err: any): boolean {
     message.includes("token-limit") ||
     message.includes("insufficient quota") ||
     message.includes("request rate increased too quickly") ||
-    message.includes("rate increased too quickly")
+    message.includes("rate increased too quickly") ||
+    message.includes("pending activation") ||
+    message.includes("pendente de ativa") ||
+    message.includes("activate your account") ||
+    message.includes("activation link")
   );
 }
 
@@ -260,11 +268,21 @@ export async function acquireUpstreamStream(
 
       if (allConfiguredAccountsOnCooldown && !verifiedPersistedCooldown) {
         verifiedPersistedCooldown = true;
+
+        if (config.accountCreator.enabled) {
+          // Prefer automatic account creation over forcing exhausted accounts back online.
+          console.warn(
+            `⚠️  [Chat] All accounts are on cooldown; deferring to automatic account creator instead of clearing cooldowns.`,
+          );
+          account = null;
+          continue;
+        }
+
         console.warn(
           `⚠️  [Chat] All accounts are on cooldown; clearing cooldowns and resetting all profiles in background.`,
         );
 
-        // Clear all cooldowns
+        // Clear all cooldowns (legacy fallback when auto-creator is disabled)
         for (const acc of configuredAccounts) {
           clearAccountCooldown(acc.id);
         }
@@ -431,6 +449,89 @@ export async function acquireUpstreamStream(
 
   // All accounts exhausted.
   removeStream(completionId);
+
+  const allConfiguredOnCooldown =
+    configuredAccounts.length > 0 &&
+    configuredAccounts.every((acc) => getAccountCooldownInfo(acc.id) !== null);
+
+  // When every existing account is unusable (rate limit / cooldown / empty pool),
+  // create + authenticate a new one and retry once with it.
+  if (
+    config.accountCreator.enabled &&
+    (configuredAccounts.length === 0 || allConfiguredOnCooldown)
+  ) {
+    const trigger =
+      configuredAccounts.length === 0 ? "no-accounts" : "all-cooldown";
+    console.warn(
+      `⚠️  [Chat] Pool esgotado (${trigger}); tentando criar conta automaticamente…`,
+    );
+    try {
+      const created = await ensureAccountForRateLimit(trigger);
+      if (created.accountId) {
+        const credentials = getAccountCredentials(created.accountId);
+        if (credentials) {
+          console.log(
+            `✅ [Chat] Conta automática pronta | ${maskEmail(credentials.email)} | retentando request…`,
+          );
+          const retryResult = await tryCreateStreamWithRetry(
+            {
+              finalPrompt: params.fullPrompt,
+              isThinkingModel,
+              model,
+              shouldResetUpstreamThread,
+              allFiles,
+              sessionId,
+              useThreadNative,
+              updateLogicalThread,
+              forceNewChat: true,
+              existingThread: null,
+              messageCount: params.fullMessageCount ?? params.messageCount,
+              fullMessageCount: params.fullMessageCount,
+              toolsCount: params.toolsCount,
+              requestPersonalizationInstruction:
+                params.requestPersonalizationInstruction,
+              fullPrompt: params.fullPrompt,
+            },
+            credentials.id,
+            maskEmail(credentials.email),
+          );
+          if (retryResult.success) {
+            registerStream(completionId, {
+              abortController: retryResult.controller,
+              accountId: retryResult.accountId,
+              uiSessionId: retryResult.uiSessionId,
+              targetResponseId: "",
+              headers: retryResult.headers,
+            });
+            return {
+              stream: retryResult.stream,
+              uiSessionId: retryResult.uiSessionId,
+              activeAccountId: retryResult.accountId,
+              activeAccountLabel: maskEmail(credentials.email),
+              completionId,
+              logicalSessionId:
+                useThreadNative && updateLogicalThread ? sessionId : null,
+              createdNewChat: retryResult.createdNewChat,
+              tokenEstimationContext: {
+                ...retryResult.tokenEstimationContext,
+                requestDeclaredToolCount: params.toolsCount ?? 0,
+              },
+            };
+          }
+          lastError = retryResult.error;
+        }
+      } else if (created.error || created.skippedReason) {
+        console.warn(
+          `⚠️  [Chat] Auto-create não produziu conta: ${created.error || created.skippedReason}`,
+        );
+      }
+    } catch (autoErr) {
+      console.error(
+        `❌ [Chat] Auto-create falhou:`,
+        autoErr instanceof Error ? autoErr.message : String(autoErr),
+      );
+    }
+  }
 
   if (!lastError && configuredAccounts.length > 0) {
     const cooldownInfos = configuredAccounts
@@ -681,12 +782,20 @@ async function tryCreateStreamWithRetry(
       const hourHint = err.message?.match(/Wait about (\d+) hour/);
       let cooldownMs: number | undefined;
       let cooldownReason = "RateLimited";
+      const lower = String(err.message || errMsg || "").toLowerCase();
 
-      if (hourHint) {
+      if (
+        lower.includes("pending activation") ||
+        lower.includes("pendente de ativa") ||
+        lower.includes("activation link")
+      ) {
+        cooldownMs = 24 * 60 * 60 * 1000;
+        cooldownReason = "PendingActivation";
+      } else if (hourHint) {
         cooldownMs = parseInt(hourHint[1]) * 60 * 60 * 1000;
       } else if (
-        errMsg.toLowerCase().includes("request rate increased too quickly") ||
-        errMsg.toLowerCase().includes("rate increased too quickly")
+        lower.includes("request rate increased too quickly") ||
+        lower.includes("rate increased too quickly")
       ) {
         // Temporary rate limit — shorter cooldown (5 min)
         cooldownMs = 5 * 60 * 1000;

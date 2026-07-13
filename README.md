@@ -2,6 +2,8 @@
 
 API compatível com OpenAI que conecta clientes ao **Qwen (`chat.qwen.ai`)** com suporte a múltiplas contas, tool calling robusto, uploads multimodais e sessões persistentes. Inclui modo Playwright com stealth para evasão de anti-bot, rotação com cooldown, variantes `-no-thinking`, sumarização de contexto, cache comprimido e observabilidade.
 
+Este fork adiciona **painel web de contas**, **criação/autenticação automática** e **auto-create no rate limit** — sem versionar banco SQLite, senhas ou perfis de browser.
+
 [![CI](https://github.com/johngbl/QwenBridge/actions/workflows/ci.yml/badge.svg)](https://github.com/johngbl/QwenBridge/actions/workflows/ci.yml)
 [![TypeScript](https://img.shields.io/badge/TypeScript-6.0-blue)](https://www.typescriptlang.org/)
 [![Hono](https://img.shields.io/badge/Hono-4.12-green)](https://hono.dev/)
@@ -19,6 +21,10 @@ API compatível com OpenAI que conecta clientes ao **Qwen (`chat.qwen.ai`)** com
 - **Payload size limit** — Validação de tamanho (10MB) antes de enviar ao Qwen.
 - **Modelos Qwen atuais** — Funciona com a família `qwen3.x` e expõe variantes sintéticas `-no-thinking`.
 - **Múltiplas contas** — Rotação round-robin, cooldown automático e inicialização paralela.
+- **Aplicação de gerenciamento** — Painel local (`/`) e janela desktop para listar, adicionar, autenticar, remover e acompanhar contas.
+- **Cadastro assistido** — Preenche o cadastro do Qwen, aguarda a verificação humana e incorpora a sessão confirmada ao pool.
+- **Criação automática de contas** — Quando **todas** as contas entram em rate limit/cooldown (ou o pool está vazio), cria + autentica uma nova conta e retenta a request.
+- **Auto-auth no pool** — Contas adicionadas/criadas pelo painel ou API entram autenticadas no pool (Playwright).
 - **Persistência de sessão** — Cookies/JWT do Qwen persistidos por conta no SQLite.
 - **Uploads multimodais** — Imagens, vídeo, áudio e documentos enviados ao OSS do Qwen.
 - **Tool calling robusto** — Parser tolerante a stream fragmentado, JSON malformado e blocos XML/Hermes-style.
@@ -26,6 +32,27 @@ API compatível com OpenAI que conecta clientes ao **Qwen (`chat.qwen.ai`)** com
 - **Cache com compressão Brotli** — TTL em memória, métricas e serialização segura.
 - **Observabilidade** — `/health`, `/metrics`, watchdog e métricas Prometheus.
 - **Deploy simples** — `npm`, Docker e graceful shutdown.
+
+---
+
+## Privacidade no GitHub (fork)
+
+Este projeto **não deve versionar** dados de contas. O `.gitignore` cobre:
+
+| Item | Path típico | Motivo |
+|---|---|---|
+| SQLite | `data/db/qwenbridge.db` (+ `-wal`/`-shm`) | Contas, cooldowns, sessões |
+| Chave de criptografia | `data/db/.encryption_key` | Descriptografa senhas no DB |
+| Perfis Playwright | `data/qwen_profiles/` | Cookies/JWT do Qwen |
+| Exports | `accounts.txt`, `accounts.json`, `cookies.json` | Credenciais em texto |
+| Env local | `.env` | Senhas e tokens |
+
+Use apenas `.env.example` no repositório. Antes do primeiro push do fork:
+
+```bash
+git status --ignored
+# confira que data/, *.db, .env e accounts.* estão ignorados
+```
 
 ---
 
@@ -146,6 +173,46 @@ QWEN_ACCOUNTS=user1@example.com:senha1;user2@example.com:senha2
 npm start
 ```
 
+O painel de gerenciamento fica disponível em:
+
+```text
+http://127.0.0.1:3000/
+```
+
+Para iniciar como aplicação desktop:
+
+```bash
+npm run desktop
+```
+
+### Painel (dashboard)
+
+| Ação | O que faz |
+|---|---|
+| **Fila de contas** | Lista contas do pool (e-mail, id, autenticada/inativa, cooldown) |
+| **Adicionar conta** | Conta existente → salva criptografada + autentica + entra no pool |
+| **Criar conta** | Cadastro com e-mail/senha que você define (browser Playwright) |
+| **Criar automática** | Gera e-mail/senha aleatórios, autentica e adiciona ao pool |
+| **Autenticar / Remover** | Revalida sessão ou remove conta + perfil local |
+| **Configuração** | Base URL, API key e `ADMIN_TOKEN` opcional |
+
+CAPTCHA e confirmação de e-mail, quando exigidos pelo Qwen, devem ser concluídos manualmente na janela do browser. Depois disso a conta é autenticada e inserida no pool automaticamente.
+
+### Auto-create no rate limit
+
+Quando o pool inteiro está em cooldown/rate limit (ou não há contas):
+
+1. O proxy **não força** limpar cooldowns (com auto-create ativo)
+2. Dispara o criador automático **completo**
+3. Gera e-mail (Saints-style / mail.tm) e preenche cadastro no Qwen
+4. Captura cookies/sessão (como `qwenproxy-create.exe`); e-mail OTP é best-effort, não bloqueia sozinho
+5. Só marca `ready=true` depois do Playwright do pool autenticar de verdade
+6. **Retenta a request** com a conta nova
+
+Se CAPTCHA não for resolvido automaticamente, a janela do browser fica aberta para conclusão manual — a conta **não** entra no pool até a sessão autenticada ser capturada.
+
+Desative com `ACCOUNT_CREATOR_ENABLED=false`.
+
 ---
 
 ## Testes
@@ -167,6 +234,7 @@ npm run test:live  # Só reais/live
 | `PORT` | `3000` | Porta HTTP do proxy. |
 | `HOST` | `0.0.0.0` | Host de bind. Para uso local, `127.0.0.1`. |
 | `API_KEY` | vazio | Protege rotas `/v1/*` com `Authorization: Bearer ...`. |
+| `ADMIN_TOKEN` | vazio | Opcional. Protege `/api/admin/*`; informe o mesmo token em Configuração no painel. |
 
 ### Autenticação e sessão
 
@@ -207,6 +275,16 @@ O Playwright também aplica um fingerprint estável por conta (UA Chrome 149, lo
 | `ANTI_BOT_BASE_DELAY_MS` | `5000` | Delay base para erros anti-bot. |
 | `ANTI_BOT_MAX_DELAY_MS` | `30000` | Cap do exponential backoff anti-bot. |
 | `ACCOUNT_COOLDOWN_MS` | `60000` | Cooldown padrão (Qwen sobrescreve quando informa tempo). |
+
+### Criador automático de contas
+
+| Variável | Default | Descrição |
+|---|---|---|
+| `ACCOUNT_CREATOR_ENABLED` | `true` | Cria conta nova quando o pool está esgotado (rate limit/cooldown/vazio). |
+| `ACCOUNT_CREATOR_TIMEOUT_MS` | `600000` | Timeout máximo por cadastro (CAPTCHA/e-mail podem demorar). |
+| `ACCOUNT_CREATOR_COOLDOWN_MS` | `30000` | Intervalo mínimo entre criações automáticas. |
+| `ACCOUNT_CREATOR_MAX_BATCH` | `5` | Máximo de contas por chamada manual/batch. |
+| `ACCOUNT_CREATOR_AUTO_AUTH` | `true` | Autentica automaticamente ao adicionar conta via admin/API. |
 
 ### Timeouts
 
@@ -253,7 +331,8 @@ O QwenBridge detecta automaticamente erros de anti-bot:
 **Fluxo:**
 1. Erro detectado → retry com delay exponencial + jitter
 2. Retry falha → rotação para próxima conta
-3. Todas falham → erro retornado ao cliente
+3. Todas em rate limit/cooldown → **criação automática de conta** (se habilitada) e retentativa
+4. Se ainda falhar → erro retornado ao cliente
 
 **Com Playwright:** Cada conta tem seu próprio fingerprint (`bx-ua`, `bx-umidtoken`) capturado do browser real.
 
@@ -281,9 +360,25 @@ O QwenBridge detecta automaticamente erros de anti-bot:
 
 | Rota | Método | Descrição |
 |---|---|---|
+| `/` | GET | Dashboard web (contas / criação) |
 | `/health` | GET | Health check |
 | `/metrics` | GET | Métricas Prometheus |
 | `/v1/upload` | POST | Upload de arquivos |
+
+### Admin (painel / automação)
+
+> Se `ADMIN_TOKEN` estiver definido, envie header `X-Admin-Token`.
+
+| Rota | Método | Descrição |
+|---|---|---|
+| `/api/admin/overview` | GET | Contas, jobs de cadastro, status do auto-creator e base URL |
+| `/api/admin/accounts` | POST | Adiciona conta (`email`, `password`; autentica por padrão) |
+| `/api/admin/accounts/:id` | DELETE | Remove conta + sessão/perfil local |
+| `/api/admin/accounts/:id/authenticate` | POST | Reautentica conta no Playwright |
+| `/api/admin/registrations` | POST | Cadastro assistido com e-mail/senha informados |
+| `/api/admin/registrations/:id` | GET | Status do job de cadastro |
+| `/api/admin/account-creator` | GET | Status do criador automático |
+| `/api/admin/account-creator/run` | POST | Cria N contas automáticas (`{"count":1}`; `?wait=1` espera o fim) |
 
 ---
 
@@ -420,6 +515,7 @@ QwenBridge/
 | Comando | Descrição |
 |---|---|
 | `npm start` | Iniciar servidor |
+| `npm run desktop` | Iniciar servidor e painel em uma janela desktop |
 | `npm run login` | Gerenciar contas |
 | `npm test` | Rodar todos os testes |
 | `npm run test:mock` | Testes com mock |

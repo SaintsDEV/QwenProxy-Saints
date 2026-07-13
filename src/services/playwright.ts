@@ -715,54 +715,74 @@ async function captureHeaders(accountId: string): Promise<void> {
     page
       .route("**/api/v2/chat/completions*", routeHandler)
       .then(async () => {
-        // Navigate to Qwen and trigger a request
-        await page.goto("https://chat.qwen.ai/", {
-          waitUntil: "domcontentloaded",
-        });
-        await sleep(2000);
-
-        // Type something and send to trigger header capture
-        const inputSelector =
-          'textarea:visible, [contenteditable="true"]:visible';
         try {
-          await page.focus(inputSelector);
-          await page.fill(inputSelector, "");
-          await page.type(inputSelector, "a", { delay: 100 });
-          await sleep(2000);
+          // Navigate to Qwen and trigger a request that includes bx-* headers.
+          await page.goto("https://chat.qwen.ai/", {
+            waitUntil: "domcontentloaded",
+            timeout: config.timeouts.navigation,
+          });
+          await sleep(1500);
 
-          // Try to click send button
-          const sendSelectors = [
-            ".message-input-right-button-send .send-button",
-            ".chat-prompt-send-button",
-            "button.send-button",
-          ];
+          // Prefer UI composer when available, but never hang forever if DOM differs.
+          const inputSelector =
+            'textarea:visible, [contenteditable="true"]:visible';
+          const input = page.locator(inputSelector).first();
+          const hasInput = await input
+            .isVisible({ timeout: 8_000 })
+            .catch(() => false);
 
-          let clicked = false;
-          for (const selector of sendSelectors) {
-            try {
-              const btn = await page.$(selector);
-              if (btn && (await btn.isVisible())) {
-                // DOM click first (more faithful to real user interaction)
-                await page.evaluate((sel) => {
-                  const element = document.querySelector(sel) as HTMLElement;
-                  if (element) {
-                    element.focus();
-                    element.click();
-                  }
-                }, selector);
+          if (hasInput) {
+            await input.click({ timeout: 5_000 }).catch(() => {});
+            await input.fill("a").catch(async () => {
+              await page.keyboard.type("a", { delay: 40 });
+            });
+            await sleep(800);
 
-                await btn.click({ force: true, delay: 50 }).catch(() => {});
+            const sendSelectors = [
+              ".message-input-right-button-send .send-button",
+              ".chat-prompt-send-button",
+              "button.send-button",
+              'button[aria-label*="send" i]',
+              'button:has-text("Send")',
+              'button:has-text("Enviar")',
+            ];
+            let clicked = false;
+            for (const selector of sendSelectors) {
+              const btn = page.locator(selector).first();
+              if (await btn.isVisible().catch(() => false)) {
+                await btn.click({ force: true, timeout: 3_000 }).catch(() => {});
                 clicked = true;
                 break;
               }
-            } catch {
-              // Try next selector
             }
-          }
-
-          if (!clicked) {
-            // Fallback to Enter key
-            await page.keyboard.press("Enter");
+            if (!clicked) await page.keyboard.press("Enter").catch(() => {});
+          } else {
+            // Fallback: fire a same-origin fetch so the browser attaches bx/cookie headers.
+            console.warn(
+              `[Playwright] Composer not found for ${accountId}; using fetch fallback for header capture`,
+            );
+            await page
+              .evaluate(async () => {
+                try {
+                  await fetch("https://chat.qwen.ai/api/v2/chat/completions", {
+                    method: "POST",
+                    headers: {
+                      accept: "application/json, text/plain, */*",
+                      "content-type": "application/json",
+                      source: "web",
+                    },
+                    body: JSON.stringify({
+                      model: "qwen3.5-flash",
+                      messages: [{ role: "user", content: "a" }],
+                      stream: false,
+                    }),
+                    credentials: "include",
+                  });
+                } catch {
+                  // aborted by route handler is fine
+                }
+              })
+              .catch(() => {});
           }
         } catch (err) {
           console.warn(`❌ [Playwright] Error triggering request: ${err}`);
@@ -1126,5 +1146,34 @@ export function getPlaywrightStatus(): Record<
       hasHeaders: !!cache.headers["bx-ua"],
     };
   }
+  // include initialized pages even if header cache empty
+  for (const accountId of accountPages.keys()) {
+    if (!status[accountId]) {
+      status[accountId] = {
+        initialized: true,
+        hasHeaders: false,
+      };
+    }
+  }
   return status;
+}
+
+export function accountHasCapturedHeaders(accountId: string): boolean {
+  const cache = headerCaches.get(accountId);
+  return Boolean(cache?.headers?.["bx-ua"]);
+}
+
+export async function ensureAccountHeaders(
+  accountId: string,
+  force = false,
+): Promise<boolean> {
+  if (!force && accountHasCapturedHeaders(accountId)) return true;
+  if (!accountPages.has(accountId)) return false;
+  const release = await getAccountMutex(accountId).acquire();
+  try {
+    await captureHeaders(accountId);
+    return accountHasCapturedHeaders(accountId);
+  } finally {
+    release();
+  }
 }

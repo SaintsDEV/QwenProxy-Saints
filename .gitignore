@@ -3,35 +3,85 @@ node_modules/
 
 # Build
 dist/
+build/
+out/
+release/
+release-dist/
 
-# Environment
+# Environment / secrets
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*
+secrets*
 
-# Persistent runtime data (DB, profiles, benchmarks, diagnostics)
-data/
+# Persistent runtime data (DB, accounts, sessions, browser profiles)
+# Keep only the empty data/ folder in git via .gitkeep
+data/**
+!data/.gitkeep
+
+# SQLite databases and sidecars (anywhere in the repo)
 *.db
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+
+# Account dumps / credential exports
 accounts.json
 accounts.json.bak
+accounts.txt
+accounts.csv
+*.accounts
+qwen_accounts*
+tokens.json
+cookies.json
+session*.json
+
+# Encryption key used to decrypt stored account passwords
+.encryption_key
+**/.encryption_key
+
+# Playwright / browser profiles (may contain cookies/JWT)
+qwen_profiles/
+**/qwen_profiles/
+playwright-report/
+test-results/
+blob-report/
 
 # Logs
 *.log
 log*.txt
+logs/
 
 # Local network captures may contain cookies/tokens
 network/
+har/
+*.har
 
 # Coverage & cache
 coverage/
 .cache/
+.turbo/
+.tsx/
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
 .kilo
 .roo
+.cursor/
+.hermes/

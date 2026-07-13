@@ -87,6 +87,12 @@ const envSchema = z
     SESSION_KEEP_ALIVE_INTERVAL_MS: z.string().default("180000"),
     SESSION_KEEP_ALIVE_IDLE_MS: z.string().default("120000"),
     SESSION_KEEP_ALIVE_NAVIGATION_INTERVAL_MS: z.string().default("480000"),
+    // Automatic account creator (rate-limit / pool empty)
+    ACCOUNT_CREATOR_ENABLED: z.string().default("true"),
+    ACCOUNT_CREATOR_TIMEOUT_MS: z.string().default("600000"),
+    ACCOUNT_CREATOR_COOLDOWN_MS: z.string().default("30000"),
+    ACCOUNT_CREATOR_MAX_BATCH: z.string().default("5"),
+    ACCOUNT_CREATOR_AUTO_AUTH: z.string().default("true"),
     API_KEY: z.string().default(""),
   })
   .superRefine((env, ctx) => {
@@ -243,6 +249,13 @@ export const config = {
     navigationIntervalMs: parseInt(
       env.SESSION_KEEP_ALIVE_NAVIGATION_INTERVAL_MS,
     ),
+  },
+  accountCreator: {
+    enabled: env.ACCOUNT_CREATOR_ENABLED !== "false",
+    timeoutMs: Math.max(30_000, parseInt(env.ACCOUNT_CREATOR_TIMEOUT_MS)),
+    cooldownMs: Math.max(0, parseInt(env.ACCOUNT_CREATOR_COOLDOWN_MS)),
+    maxBatch: Math.max(1, Math.min(50, parseInt(env.ACCOUNT_CREATOR_MAX_BATCH))),
+    autoAuth: env.ACCOUNT_CREATOR_AUTO_AUTH !== "false",
   },
   apiKey: env.API_KEY,
   qwen: {
