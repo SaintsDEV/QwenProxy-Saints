@@ -1079,12 +1079,12 @@ async function openSignupAndFill(
     return fieldLocator.first().isVisible().catch(() => false);
   }
 
-  const entryUrls = [
-    "https://chat.qwen.ai/auth",
-    "https://chat.qwen.ai/?mode=register",
-    "https://chat.qwen.ai/auth?tab=signup",
-    "https://chat.qwen.ai/auth?mode=register",
-  ];
+  // Canonical signup URL (NOT bare /?mode=register — that lands on chat shell).
+    const entryUrls = [
+      "https://chat.qwen.ai/auth?mode=register",
+      "https://chat.qwen.ai/auth?tab=signup",
+      "https://chat.qwen.ai/auth",
+    ];
 
   let lastDiag = "";
   for (let round = 0; round < entryUrls.length; round++) {
@@ -1190,20 +1190,20 @@ async function openSignupAndFill(
     .then(() => true)
     .catch(() => false);
   if (!signupReady) {
-    // Still only login? one more forced navigation
-    await page
-      .goto("https://chat.qwen.ai/?mode=register", {
-        waitUntil: "domcontentloaded",
-        timeout: 45_000,
-      })
-      .catch(() => {});
-    await sleep(1_500);
-    await tryOpenSignupFromLogin();
-    await signupMarkers
-      .first()
-      .waitFor({ state: "visible", timeout: 12_000 })
-      .catch(() => {});
-  }
+      // Still only login? force the real register route under /auth
+      await page
+        .goto("https://chat.qwen.ai/auth?mode=register", {
+          waitUntil: "domcontentloaded",
+          timeout: 45_000,
+        })
+        .catch(() => {});
+      await sleep(1_500);
+      await tryOpenSignupFromLogin();
+      await signupMarkers
+        .first()
+        .waitFor({ state: "visible", timeout: 12_000 })
+        .catch(() => {});
+    }
 
   // Username: keep simple (no accents/spaces that sometimes fail validation)
   const safeName =
