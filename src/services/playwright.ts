@@ -661,46 +661,74 @@ async function loginViaUi(
         await sleep(3000);
 
         // Access Verification / Aliyun captcha often appears after password submit.
-                // Open puzzle first, then solve with vision drag.
-                try {
-                  const {
-                    isAccessVerificationVisible,
-                    openCaptchaIfNeeded,
-                    solveAliyunPuzzleCaptcha,
-                    dismissVerifiedCaptcha,
-                    isCaptchaVerified,
-                  } = await import("./aliyun-captcha-solver.ts");
-                  const captchaVisible =
-                    (await isAccessVerificationVisible(page)) ||
-                    (await page
-                      .locator(
-                        '#aliyunCaptcha-sliding-slider, #aliyunCaptcha-captcha-text, .btn_slide, text=/Access Verification|Click to start|real person|verifica/i',
-                      )
-                      .first()
-                      .isVisible()
-                      .catch(() => false));
-                  if (captchaVisible) {
-                    console.log(
-                      `🧩 [Playwright] Captcha no login de ${maskEmail(email)} — abrindo + resolvendo…`,
-                    );
-                    await openCaptchaIfNeeded(page);
-                    const result = await solveAliyunPuzzleCaptcha(page, {
-                      maxAttempts: 6,
-                    });
-                    if (result.ok || (await isCaptchaVerified(page))) {
-                      await dismissVerifiedCaptcha(page);
-                    }
-                    await sleep(2_000);
-                  }
-                } catch (captchaErr) {
-                  console.warn(
-                    `⚠️  [Playwright] Captcha no login: ${
-                      captchaErr instanceof Error
-                        ? captchaErr.message
-                        : String(captchaErr)
-                    }`,
-                  );
-                }
+                // Access Verification / Aliyun captcha often appears after password submit.
+                        // Open puzzle first, then solve fast (vision; CDP not always available here).
+                        try {
+                          const {
+                            isAccessVerificationVisible,
+                            openCaptchaIfNeeded,
+                            solveAliyunPuzzleCaptcha,
+                            dismissVerifiedCaptcha,
+                            isCaptchaVerified,
+                          } = await import("./aliyun-captcha-solver.ts");
+                          const captchaVisible =
+                            (await isAccessVerificationVisible(page)) ||
+                            (await page
+                              .locator(
+                                '#aliyunCaptcha-sliding-slider, #aliyunCaptcha-captcha-text, .btn_slide, text=/Access Verification|Click to start|real person|verifica/i',
+                              )
+                              .first()
+                              .isVisible()
+                              .catch(() => false));
+                          if (captchaVisible) {
+                            console.log(
+                              `🧩 [Playwright] Captcha no login de ${maskEmail(email)} — abrindo + resolvendo…`,
+                            );
+                            await openCaptchaIfNeeded(page);
+                            // Parallel: try CDP API if remote-debugging is exposed on this browser
+                            let apiOk = false;
+                            try {
+                              const pages = page.context().pages();
+                              const cdpUrl = (page.context() as any)._options?.args?.find?.(
+                                (a: string) => /remote-debugging-port=/.test(a),
+                              ) as string | undefined;
+                              const portMatch = cdpUrl?.match(/remote-debugging-port=(\d+)/);
+                              if (portMatch) {
+                                const { solveCaptchaViaApi } = await import(
+                                  "./aliyun-captcha-api.ts"
+                                );
+                                const r = await solveCaptchaViaApi({
+                                  cdpPort: Number(portMatch[1]),
+                                  targetUrl: "chat.qwen.ai",
+                                  timeoutMs: 25_000,
+                                });
+                                apiOk = r.ok;
+                              }
+                              void pages;
+                            } catch {
+                              // no CDP — vision only
+                            }
+                            if (!apiOk) {
+                              const result = await solveAliyunPuzzleCaptcha(page, {
+                                maxAttempts: 4,
+                              });
+                              if (result.ok || (await isCaptchaVerified(page))) {
+                                await dismissVerifiedCaptcha(page);
+                              }
+                            } else if (await isCaptchaVerified(page)) {
+                              await dismissVerifiedCaptcha(page);
+                            }
+                            await sleep(800);
+                          }
+                        } catch (captchaErr) {
+                          console.warn(
+                            `⚠️  [Playwright] Captcha no login: ${
+                              captchaErr instanceof Error
+                                ? captchaErr.message
+                                : String(captchaErr)
+                            }`,
+                          );
+                        }
 
         // Check if login was successful
         const isLoggedIn =

@@ -154,14 +154,16 @@ export async function createUrsaMailbox(page: Page): Promise<TempMailbox> {
 }
 
 /**
- * Keep the inbox tab on the mailbox WITHOUT reloading.
- * Ursa uses Firebase realtime; page.reload/goto loops kill the listener
- * and messages never appear (manual works because the tab stays open).
- *
- * Also: background Chromium tabs throttle Firebase websockets. We keep the
- * inbox tab foregrounded while waiting for mail.
+ * Soft keep-alive for the inbox tab.
+ * Prefer a single hard refresh only when explicitly requested — Firebase
+ * realtime works once the page is loaded, but a one-shot reload after
+ * signup is what makes the Qwen mail actually appear in this SPA.
  */
-async function ensureUrsaInboxOpen(page: Page, login: string): Promise<void> {
+async function ensureUrsaInboxOpen(
+  page: Page,
+  login: string,
+  options: { hardRefresh?: boolean } = {},
+): Promise<void> {
   const target = `https://tuamaeaquelaursa.com/${login}`;
   const current = page.url();
   const onMailbox = new RegExp(
@@ -169,8 +171,30 @@ async function ensureUrsaInboxOpen(page: Page, login: string): Promise<void> {
     "i",
   ).test(current);
 
-  // Always bring inbox to front so Firebase listeners stay hot.
   await page.bringToFront().catch(() => {});
+
+  if (options.hardRefresh) {
+    if (onMailbox) {
+      await page
+        .reload({ waitUntil: "domcontentloaded", timeout: 45_000 })
+        .catch(async () => {
+          await page.goto(target, {
+            waitUntil: "domcontentloaded",
+            timeout: 45_000,
+          });
+        });
+    } else {
+      await page.goto(target, {
+        waitUntil: "domcontentloaded",
+        timeout: 45_000,
+      });
+    }
+    await page
+      .waitForSelector(URSA_SELECTORS.inboxList, { timeout: 20_000 })
+      .catch(() => {});
+    await sleep(800);
+    return;
+  }
 
   if (!onMailbox) {
     await page.goto(target, {
@@ -180,24 +204,21 @@ async function ensureUrsaInboxOpen(page: Page, login: string): Promise<void> {
     await page
       .waitForSelector(URSA_SELECTORS.inboxList, { timeout: 30_000 })
       .catch(() => {});
-    await sleep(1_200);
+    await sleep(800);
   }
 
-  // Nudge Vuex to reconnect the Firestore listener if it went idle.
+  // Nudge Vuex/Firebase without full reload.
   await page
     .evaluate((loginName) => {
       try {
         const app = (document.querySelector("#app") as any)?.__vue__;
         const store = app?.$store;
         if (store?.dispatch) {
-          // site mutations: connect_to_box / hydrate_messages
           store.dispatch("connect_to_box").catch?.(() => {});
           store.commit?.("connect_to_box");
         }
-        // visibility/focus events often resume websockets
         document.dispatchEvent(new Event("visibilitychange"));
         window.dispatchEvent(new Event("focus"));
-        // ensure route params still match mailbox
         if (app?.$route?.params?.email !== loginName && app?.$router?.push) {
           app.$router.push(`/${loginName}`);
         }
@@ -342,12 +363,13 @@ function messageLooksLikeQwen(from: string, subject: string): boolean {
 }
 
 /**
- * Poll tuamaeaquelaursa WITHOUT reloading the page.
+ * Poll tuamaeaquelaursa for the Qwen activation mail.
  *
- * Flow (manual-equivalent):
- *  1) Keep the inbox tab open (Firebase realtime)
- *  2) When a Qwen-related message appears, open it
- *  3) Click "Activate My Account" / extract the activation href
+ * Manual-equivalent that actually works:
+ *  1) ONE hard refresh after signup (mail only shows up after refresh)
+ *  2) Soft poll without further reloads
+ *  3) Optional second refresh only if still empty after ~12s
+ *  4) Open Qwen message → click Activate My Account / extract link
  */
 export async function waitForUrsaVerificationLink(
   page: Page,
@@ -355,25 +377,42 @@ export async function waitForUrsaVerificationLink(
   options: {
     timeoutMs?: number;
     pollIntervalMs?: number;
+    /** Hard-reload inbox once at start (default true). */
+    refreshOnce?: boolean;
     onPoll?: (info: {
       elapsedMs: number;
       messages: number;
       sample?: string;
+      refreshed?: boolean;
     }) => void;
   } = {},
 ): Promise<VerificationPayload> {
   const timeoutMs = options.timeoutMs ?? 180_000;
-  // Soft poll only — never reload. Firebase pushes new messages live.
-  const pollIntervalMs = Math.max(options.pollIntervalMs ?? 4_000, 2_500);
+  // Soft poll — do NOT reload every cycle.
+  const pollIntervalMs = Math.max(options.pollIntervalMs ?? 2_500, 1_500);
   const login = mailbox.login || mailbox.email.split("@")[0];
   const started = Date.now();
   const deadline = started + timeoutMs;
+  let didInitialRefresh = false;
+  let didSecondRefresh = false;
 
-  await ensureUrsaInboxOpen(page, login);
+  // After account creation: one refresh so the Qwen mail becomes visible.
+  if (options.refreshOnce !== false) {
+    await ensureUrsaInboxOpen(page, login, { hardRefresh: true });
+    didInitialRefresh = true;
+    options.onPoll?.({
+      elapsedMs: 0,
+      messages: 0,
+      sample: "inbox atualizada (1x)",
+      refreshed: true,
+    });
+  } else {
+    await ensureUrsaInboxOpen(page, login);
+  }
 
   while (Date.now() < deadline) {
-    // Stay on list view while waiting for new mail.
     await backToUrsaList(page, login);
+    // Soft focus/nudge only — no reload here.
     await ensureUrsaInboxOpen(page, login);
 
     const msgs = await listUrsaMessages(page);
@@ -383,7 +422,27 @@ export async function waitForUrsaVerificationLink(
       sample: msgs[0]
         ? `${msgs[0].from} | ${msgs[0].subject}`.slice(0, 80)
         : undefined,
+      refreshed: didInitialRefresh,
     });
+
+    // Second (and last) refresh if still empty ~12s after the first.
+    if (
+      msgs.length === 0 &&
+      didInitialRefresh &&
+      !didSecondRefresh &&
+      Date.now() - started >= 12_000
+    ) {
+      await ensureUrsaInboxOpen(page, login, { hardRefresh: true });
+      didSecondRefresh = true;
+      options.onPoll?.({
+        elapsedMs: Date.now() - started,
+        messages: 0,
+        sample: "2ª atualização da inbox (última)",
+        refreshed: true,
+      });
+      await sleep(600);
+      continue;
+    }
 
     // Only open Qwen-related messages (subject like "qwen.ai active mail.")
     let idx = msgs.findIndex((m) => messageLooksLikeQwen(m.from, m.subject));
@@ -405,7 +464,7 @@ export async function waitForUrsaVerificationLink(
       await page
         .waitForSelector(URSA_SELECTORS.messageBody, { timeout: 20_000 })
         .catch(() => {});
-      await sleep(1_000);
+      await sleep(700);
 
       const body = page.locator(URSA_SELECTORS.messageBody).first();
       const html = (await body.innerHTML().catch(() => "")) || "";
@@ -468,7 +527,7 @@ export async function waitForUrsaVerificationLink(
             };
           }
         } else {
-          await sleep(1_200);
+          await sleep(1_000);
           const current = page.url();
           if (/qwen|verify|activ|confirm|token=/i.test(current)) {
             return {
@@ -551,7 +610,7 @@ export async function waitForUrsaVerificationLink(
       await backToUrsaList(page, login);
     }
 
-    // Idle wait — Firebase will push the next message without reload.
+    // Idle wait — no full reload in the loop.
     await sleep(pollIntervalMs);
   }
 

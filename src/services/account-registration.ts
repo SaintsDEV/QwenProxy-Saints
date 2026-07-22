@@ -779,87 +779,136 @@ async function handleCaptcha(
   setJob(
       job,
       "solving-captcha",
-      "CAPTCHA/Access Verification detectado — abrindo puzzle e resolvendo (API CDP open_if_needed → vision)…",
+      "CAPTCHA detectado — resolvendo rápido (API CDP open_if_needed → vision)…",
     );
 
-    // Always open the puzzle window first. Without this, Captcha API in
-    // captcha_only mode fails; we also open before open_if_needed for reliability.
+    // Open puzzle once, then hand off to the API immediately.
     await openCaptchaIfNeeded(page);
-    await sleep(800);
-    // Second open attempt if still only entry button
-    if (
-      !(await page
-        .locator("#aliyunCaptcha-sliding-slider")
-        .first()
-        .isVisible()
-        .catch(() => false))
-    ) {
-      await openCaptchaIfNeeded(page);
-    }
+    await sleep(400);
 
-  const deadline = Date.now() + timeoutMs;
-  let attemptRound = 0;
-  let triedApi = false;
+    const deadline = Date.now() + timeoutMs;
+    let attemptRound = 0;
+    let triedApi = false;
 
-  while (Date.now() < deadline) {
-    if (await pageShowsActivationPending(page)) {
-      setJob(
-        job,
-        "pending_activation",
-        "CAPTCHA ok — tela de confirmação de e-mail aberta.",
-      );
-      return;
-    }
-    if (await isCaptchaVerified(page)) {
-      await dismissVerifiedCaptcha(page);
-      setJob(job, "filling-form", "CAPTCHA Verified — seguindo fluxo.");
-      return;
-    }
-    if (await pageLooksAuthenticated(page)) return;
-
-    const stillThere =
-      (await isAccessVerificationVisible(page)) ||
-      (await pageShowsAccessVerification(page)) ||
-      (await detectCaptcha(page));
-    if (!stillThere) {
-      await sleep(800);
-      if (
-        !(await isAccessVerificationVisible(page)) &&
-        !(await detectCaptcha(page))
-      ) {
-        setJob(job, "filling-form", "CAPTCHA/verificação sumiu.");
+    while (Date.now() < deadline) {
+      if (await pageShowsActivationPending(page)) {
+        setJob(
+          job,
+          "pending_activation",
+          "CAPTCHA ok — tela de confirmação de e-mail aberta.",
+        );
         return;
       }
-    }
+      if (await isCaptchaVerified(page)) {
+        await dismissVerifiedCaptcha(page);
+        setJob(job, "filling-form", "CAPTCHA Verified — seguindo fluxo.");
+        return;
+      }
+      if (await pageLooksAuthenticated(page)) return;
 
-    attemptRound += 1;
-    await openCaptchaIfNeeded(page);
+      const stillThere =
+        (await isAccessVerificationVisible(page)) ||
+        (await pageShowsAccessVerification(page)) ||
+        (await detectCaptcha(page));
+      if (!stillThere) {
+        await sleep(400);
+        if (
+          !(await isAccessVerificationVisible(page)) &&
+          !(await detectCaptcha(page))
+        ) {
+          setJob(job, "filling-form", "CAPTCHA/verificação sumiu.");
+          return;
+        }
+      }
 
-    // 1) Prefer GLM-style external CDP solver (human_replay) — much more reliable.
-    if (cdpPort && config.accountCreator.captchaApiEnabled && !triedApi) {
-      triedApi = true;
-      setJob(
-        job,
-        "solving-captcha",
-        `Chamando Captcha API (CDP :${cdpPort}, gesture=${config.accountCreator.captchaGesture})…`,
-      );
-      const apiResult = await solveCaptchaViaApi({
-        cdpHost: config.accountCreator.cdpHost,
-        cdpPort,
-        targetUrl: "chat.qwen.ai",
-        timeoutMs: Math.min(
-          config.accountCreator.captchaJobTimeoutMs,
-          Math.max(15_000, deadline - Date.now()),
-        ),
+      attemptRound += 1;
+
+      // 1) API first (fast path). Open once more only if slider not ready.
+      if (cdpPort && config.accountCreator.captchaApiEnabled && !triedApi) {
+        triedApi = true;
+        const sliderReady = await page
+          .locator("#aliyunCaptcha-sliding-slider")
+          .first()
+          .isVisible()
+          .catch(() => false);
+        if (!sliderReady) await openCaptchaIfNeeded(page);
+
+        setJob(
+          job,
+          "solving-captcha",
+          `Captcha API rápida (CDP :${cdpPort}, ${config.accountCreator.captchaGesture})…`,
+        );
+        const apiResult = await solveCaptchaViaApi({
+          cdpHost: config.accountCreator.cdpHost,
+          cdpPort,
+          targetUrl: "chat.qwen.ai",
+          timeoutMs: Math.min(
+            Math.max(20_000, config.accountCreator.captchaJobTimeoutMs),
+            Math.max(12_000, deadline - Date.now()),
+          ),
+        });
+        if (apiResult.ok) {
+          await sleep(500);
+          if (await isCaptchaVerified(page)) await dismissVerifiedCaptcha(page);
+          if (await pageShowsActivationPending(page)) {
+            setJob(
+              job,
+              "pending_activation",
+              `CAPTCHA ok via API (${apiResult.attempts ?? "?"} tentativas).`,
+            );
+            return;
+          }
+          if (await pageLooksAuthenticated(page)) return;
+          if (
+            !(await isAccessVerificationVisible(page)) &&
+            !(await pageShowsAccessVerification(page))
+          ) {
+            setJob(
+              job,
+              "filling-form",
+              `CAPTCHA ok via API (targetX=${apiResult.targetX ?? "?"}).`,
+            );
+            return;
+          }
+          setJob(
+            job,
+            "solving-captcha",
+            "API ok mas widget ainda visível — vision rápido…",
+          );
+        } else {
+          setJob(
+            job,
+            "solving-captcha",
+            `API falhou (${apiResult.error || "unknown"}). Vision…`,
+          );
+        }
+      }
+
+      // 2) Vision fallback — fewer attempts, faster loop.
+      if (!(await page.locator("#aliyunCaptcha-sliding-slider").first().isVisible().catch(() => false))) {
+        await openCaptchaIfNeeded(page);
+      }
+      const result = await solveAliyunPuzzleCaptcha(page, {
+        maxAttempts: 3,
+        onAttempt: ({ attempt, offsetPx, confidence, status }) => {
+          setJob(
+            job,
+            "solving-captcha",
+            `Vision r${attemptRound}.${attempt}: ${status}${
+              offsetPx != null ? ` · ${offsetPx}px` : ""
+            }${confidence != null ? ` · conf ${(confidence * 100).toFixed(0)}%` : ""}`,
+          );
+        },
       });
-      if (apiResult.ok) {
-        await sleep(1_000);
+
+      if (result.ok) {
+        await sleep(400);
         if (await isCaptchaVerified(page)) await dismissVerifiedCaptcha(page);
         if (await pageShowsActivationPending(page)) {
           setJob(
             job,
             "pending_activation",
-            `CAPTCHA resolvido via API CDP (${apiResult.attempts ?? "?"} tentativas).`,
+            `CAPTCHA ok em ${result.attempts} arraste(s).`,
           );
           return;
         }
@@ -871,111 +920,54 @@ async function handleCaptcha(
           setJob(
             job,
             "filling-form",
-            `CAPTCHA resolvido via API CDP (targetX=${apiResult.targetX ?? "?"}).`,
+            `CAPTCHA ok (offset=${result.offsetPx ?? "?"}px).`,
           );
           return;
         }
-        setJob(
-          job,
-          "solving-captcha",
-          "API reportou sucesso, mas widget ainda visível — fallback vision…",
-        );
-      } else {
-        setJob(
-          job,
-          "solving-captcha",
-          `Captcha API falhou/indisponível (${apiResult.error || "unknown"}). Fallback vision in-page…`,
-        );
       }
-    }
 
-    // 2) Fallback: in-page vision drag (same captcha, no refresh).
-    const result = await solveAliyunPuzzleCaptcha(page, {
-      maxAttempts: 4,
-      onAttempt: ({ attempt, offsetPx, confidence, status }) => {
-        setJob(
-          job,
-          "solving-captcha",
-          `Vision r${attemptRound}.${attempt}: ${status}${
-            offsetPx != null ? ` · ${offsetPx}px` : ""
-          }${confidence != null ? ` · conf ${(confidence * 100).toFixed(0)}%` : ""}`,
-        );
-      },
-    });
-
-    if (result.ok) {
-      await sleep(800);
-      if (await isCaptchaVerified(page)) await dismissVerifiedCaptcha(page);
-      if (await pageShowsActivationPending(page)) {
-        setJob(
-          job,
-          "pending_activation",
-          `CAPTCHA resolvido em ${result.attempts} arraste(s) no captcha atual.`,
-        );
-        return;
-      }
-      if (await pageLooksAuthenticated(page)) return;
+      // One API retry only if still stuck.
       if (
-        !(await isAccessVerificationVisible(page)) &&
-        !(await pageShowsAccessVerification(page))
+        cdpPort &&
+        config.accountCreator.captchaApiEnabled &&
+        triedApi &&
+        attemptRound <= 2
       ) {
-        setJob(
-          job,
-          "filling-form",
-          `CAPTCHA resolvido (offset=${result.offsetPx ?? "?"}px).`,
-        );
-        return;
+        setJob(job, "solving-captcha", "Re-tentativa rápida da Captcha API…");
+        await openCaptchaIfNeeded(page);
+        const apiRetry = await solveCaptchaViaApi({
+          cdpHost: config.accountCreator.cdpHost,
+          cdpPort,
+          targetUrl: "chat.qwen.ai",
+          timeoutMs: Math.min(25_000, Math.max(10_000, deadline - Date.now())),
+        });
+        if (apiRetry.ok) {
+          await sleep(400);
+          if (await isCaptchaVerified(page)) await dismissVerifiedCaptcha(page);
+          if (
+            (await pageShowsActivationPending(page)) ||
+            (await pageLooksAuthenticated(page)) ||
+            (!(await isAccessVerificationVisible(page)) &&
+              !(await pageShowsAccessVerification(page)))
+          ) {
+            setJob(job, "pending_activation", "CAPTCHA ok na re-tentativa API.");
+            return;
+          }
+        }
       }
-    }
 
-    // Allow one more API retry after vision if still stuck and CDP is available.
-    if (cdpPort && config.accountCreator.captchaApiEnabled && triedApi) {
       setJob(
         job,
         "solving-captcha",
-        "Vision não limpou o widget — re-tentando Captcha API no captcha atual…",
+        `Ainda no captcha (${result.error || "retry"})…`,
       );
-      await openCaptchaIfNeeded(page);
-      const apiRetry = await solveCaptchaViaApi({
-        cdpHost: config.accountCreator.cdpHost,
-        cdpPort,
-        targetUrl: "chat.qwen.ai",
-        timeoutMs: Math.min(
-          config.accountCreator.captchaJobTimeoutMs,
-          Math.max(15_000, deadline - Date.now()),
-        ),
-      });
-      if (apiRetry.ok) {
-        await sleep(1_000);
-        if (await isCaptchaVerified(page)) await dismissVerifiedCaptcha(page);
-        if (
-          (await pageShowsActivationPending(page)) ||
-          (await pageLooksAuthenticated(page)) ||
-          (!(await isAccessVerificationVisible(page)) &&
-            !(await pageShowsAccessVerification(page)))
-        ) {
-          setJob(
-            job,
-            "pending_activation",
-            "CAPTCHA resolvido na re-tentativa da API CDP.",
-          );
-          return;
-        }
-      }
+      await sleep(400);
     }
 
-    setJob(
-      job,
-      "solving-captcha",
-      `Ainda no captcha (${result.error || "retry"}). Re-capturando sem recarregar…`,
+    throw new Error(
+      "CAPTCHA atual não resolvido a tempo (API CDP + vision). Sem captcha ok o Qwen NÃO envia o e-mail de ativação.",
     );
-    await sleep(900);
   }
-
-  throw new Error(
-    "CAPTCHA atual não resolvido a tempo (API CDP + vision). Sem captcha ok o Qwen NÃO envia o e-mail de ativação.",
-  );
-}
 
 /**
  * Real Qwen Studio auth form (2026):
@@ -1524,9 +1516,8 @@ async function applyVerification(
           }
 
           // Dedicated automatic inbox poll + link extract.
-                    // IMPORTANT: keep ursa tab FOREGROUNDED. Background Chromium throttles
-                    // Firebase websockets — that's why normal Chrome sees mail and the
-                    // automation browser used to stay empty.
+                    // ONE hard refresh after signup (mail only appears after refresh),
+                    // then soft poll — never reload every few seconds.
                     if (inboxPage && mailbox.provider === "tuamaeaquelaursa" && autoVerify) {
                       try {
                         await inboxPage.bringToFront().catch(() => {});
@@ -1540,28 +1531,31 @@ async function applyVerification(
                             .catch(() => {});
                         }
 
-                        // Continuous wait with inbox in foreground (no reload).
+                        // First wait slice: hard-refresh once so Qwen mail shows up.
+                        // Later slices: soft poll only (refreshOnce=false).
+                        const isFirstWait = !linkClickAttempts && lastMsgCount === 0 && elapsedMs < 60_000;
                         verification = await waitForUrsaVerificationLink(inboxPage, mailbox, {
-                          timeoutMs: 50_000,
-                          pollIntervalMs: 3_500,
-                          onPoll: ({ messages, sample }) => {
+                          timeoutMs: 45_000,
+                          pollIntervalMs: 2_000,
+                          refreshOnce: isFirstWait || elapsedMs < 8_000,
+                          onPoll: ({ messages, sample, refreshed }) => {
                             lastMsgCount = messages;
                             setJob(
                               job,
                               "pending_activation",
-                              `Inbox em FOCO (sem reload) · ${messages} msg · ${Math.round(elapsedMs / 1000)}s · resends=${resendCount}${sample ? ` · ${sample}` : ""}`,
+                              `${refreshed ? "Inbox atualizada · " : ""}${messages} msg · ${Math.round(elapsedMs / 1000)}s · resends=${resendCount}${sample ? ` · ${sample}` : ""}`,
                             );
                           },
                         });
                       } catch {
-                        // slice timeout — continue outer loop (still no reload)
+                        // slice timeout — continue outer loop (no reload spam)
                         await inboxPage.bringToFront().catch(() => {});
                         const msgs = await listUrsaMessages(inboxPage).catch(() => []);
                         lastMsgCount = msgs.length;
                         setJob(
                           job,
                           "pending_activation",
-                          `Aguardando e-mail Qwen (inbox em foco) · ${msgs.length} msg · ${Math.round(elapsedMs / 1000)}s · resends=${resendCount}`,
+                          `Aguardando e-mail Qwen · ${msgs.length} msg · ${Math.round(elapsedMs / 1000)}s · resends=${resendCount}`,
                         );
                       } finally {
                         // After a wait slice, restore Qwen tab only briefly for resend/probe.
