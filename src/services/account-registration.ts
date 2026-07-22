@@ -777,197 +777,193 @@ async function handleCaptcha(
   }
 
   setJob(
+    job,
+    "solving-captcha",
+    "CAPTCHA na tela — acionando API imediatamente…",
+  );
+
+  const deadline = Date.now() + timeoutMs;
+  let attemptRound = 0;
+  let triedApi = false;
+
+  // INSTANT PATH: fire Captcha API as soon as Access Verification is visible.
+  // open_if_needed makes the solver click "Click to start verification" itself.
+  if (cdpPort && config.accountCreator.captchaApiEnabled) {
+    triedApi = true;
+    // Non-blocking open in parallel with API start (API also opens if needed)
+    const openPromise = openCaptchaIfNeeded(page).catch(() => false);
+    setJob(
       job,
       "solving-captcha",
-      "CAPTCHA detectado — resolvendo rápido (API CDP open_if_needed → vision)…",
+      `Captcha API INSTANT (CDP :${cdpPort}, ${config.accountCreator.captchaGesture})…`,
     );
-
-    // Open puzzle once, then hand off to the API immediately.
-    await openCaptchaIfNeeded(page);
-    await sleep(400);
-
-    const deadline = Date.now() + timeoutMs;
-    let attemptRound = 0;
-    let triedApi = false;
-
-    while (Date.now() < deadline) {
+    const apiResult = await solveCaptchaViaApi({
+      cdpHost: config.accountCreator.cdpHost,
+      cdpPort,
+      targetUrl: "chat.qwen.ai",
+      timeoutMs: Math.min(
+        Math.max(18_000, config.accountCreator.captchaJobTimeoutMs),
+        Math.max(12_000, deadline - Date.now()),
+      ),
+    });
+    await openPromise;
+    if (apiResult.ok) {
+      await sleep(300);
+      if (await isCaptchaVerified(page)) await dismissVerifiedCaptcha(page);
       if (await pageShowsActivationPending(page)) {
         setJob(
           job,
           "pending_activation",
-          "CAPTCHA ok — tela de confirmação de e-mail aberta.",
+          `CAPTCHA ok via API (${apiResult.attempts ?? "?"} tentativas).`,
         );
-        return;
-      }
-      if (await isCaptchaVerified(page)) {
-        await dismissVerifiedCaptcha(page);
-        setJob(job, "filling-form", "CAPTCHA Verified — seguindo fluxo.");
         return;
       }
       if (await pageLooksAuthenticated(page)) return;
-
-      const stillThere =
-        (await isAccessVerificationVisible(page)) ||
-        (await pageShowsAccessVerification(page)) ||
-        (await detectCaptcha(page));
-      if (!stillThere) {
-        await sleep(400);
-        if (
-          !(await isAccessVerificationVisible(page)) &&
-          !(await detectCaptcha(page))
-        ) {
-          setJob(job, "filling-form", "CAPTCHA/verificação sumiu.");
-          return;
-        }
-      }
-
-      attemptRound += 1;
-
-      // 1) API first (fast path). Open once more only if slider not ready.
-      if (cdpPort && config.accountCreator.captchaApiEnabled && !triedApi) {
-        triedApi = true;
-        const sliderReady = await page
-          .locator("#aliyunCaptcha-sliding-slider")
-          .first()
-          .isVisible()
-          .catch(() => false);
-        if (!sliderReady) await openCaptchaIfNeeded(page);
-
+      if (
+        !(await isAccessVerificationVisible(page)) &&
+        !(await pageShowsAccessVerification(page))
+      ) {
         setJob(
           job,
-          "solving-captcha",
-          `Captcha API rápida (CDP :${cdpPort}, ${config.accountCreator.captchaGesture})…`,
+          "filling-form",
+          `CAPTCHA ok via API (targetX=${apiResult.targetX ?? "?"}).`,
         );
-        const apiResult = await solveCaptchaViaApi({
-          cdpHost: config.accountCreator.cdpHost,
-          cdpPort,
-          targetUrl: "chat.qwen.ai",
-          timeoutMs: Math.min(
-            Math.max(20_000, config.accountCreator.captchaJobTimeoutMs),
-            Math.max(12_000, deadline - Date.now()),
-          ),
-        });
-        if (apiResult.ok) {
-          await sleep(500);
-          if (await isCaptchaVerified(page)) await dismissVerifiedCaptcha(page);
-          if (await pageShowsActivationPending(page)) {
-            setJob(
-              job,
-              "pending_activation",
-              `CAPTCHA ok via API (${apiResult.attempts ?? "?"} tentativas).`,
-            );
-            return;
-          }
-          if (await pageLooksAuthenticated(page)) return;
-          if (
-            !(await isAccessVerificationVisible(page)) &&
-            !(await pageShowsAccessVerification(page))
-          ) {
-            setJob(
-              job,
-              "filling-form",
-              `CAPTCHA ok via API (targetX=${apiResult.targetX ?? "?"}).`,
-            );
-            return;
-          }
-          setJob(
-            job,
-            "solving-captcha",
-            "API ok mas widget ainda visível — vision rápido…",
-          );
-        } else {
-          setJob(
-            job,
-            "solving-captcha",
-            `API falhou (${apiResult.error || "unknown"}). Vision…`,
-          );
-        }
+        return;
       }
-
-      // 2) Vision fallback — fewer attempts, faster loop.
-      if (!(await page.locator("#aliyunCaptcha-sliding-slider").first().isVisible().catch(() => false))) {
-        await openCaptchaIfNeeded(page);
-      }
-      const result = await solveAliyunPuzzleCaptcha(page, {
-        maxAttempts: 3,
-        onAttempt: ({ attempt, offsetPx, confidence, status }) => {
-          setJob(
-            job,
-            "solving-captcha",
-            `Vision r${attemptRound}.${attempt}: ${status}${
-              offsetPx != null ? ` · ${offsetPx}px` : ""
-            }${confidence != null ? ` · conf ${(confidence * 100).toFixed(0)}%` : ""}`,
-          );
-        },
-      });
-
-      if (result.ok) {
-        await sleep(400);
-        if (await isCaptchaVerified(page)) await dismissVerifiedCaptcha(page);
-        if (await pageShowsActivationPending(page)) {
-          setJob(
-            job,
-            "pending_activation",
-            `CAPTCHA ok em ${result.attempts} arraste(s).`,
-          );
-          return;
-        }
-        if (await pageLooksAuthenticated(page)) return;
-        if (
-          !(await isAccessVerificationVisible(page)) &&
-          !(await pageShowsAccessVerification(page))
-        ) {
-          setJob(
-            job,
-            "filling-form",
-            `CAPTCHA ok (offset=${result.offsetPx ?? "?"}px).`,
-          );
-          return;
-        }
-      }
-
-      // One API retry only if still stuck.
-      if (
-        cdpPort &&
-        config.accountCreator.captchaApiEnabled &&
-        triedApi &&
-        attemptRound <= 2
-      ) {
-        setJob(job, "solving-captcha", "Re-tentativa rápida da Captcha API…");
-        await openCaptchaIfNeeded(page);
-        const apiRetry = await solveCaptchaViaApi({
-          cdpHost: config.accountCreator.cdpHost,
-          cdpPort,
-          targetUrl: "chat.qwen.ai",
-          timeoutMs: Math.min(25_000, Math.max(10_000, deadline - Date.now())),
-        });
-        if (apiRetry.ok) {
-          await sleep(400);
-          if (await isCaptchaVerified(page)) await dismissVerifiedCaptcha(page);
-          if (
-            (await pageShowsActivationPending(page)) ||
-            (await pageLooksAuthenticated(page)) ||
-            (!(await isAccessVerificationVisible(page)) &&
-              !(await pageShowsAccessVerification(page)))
-          ) {
-            setJob(job, "pending_activation", "CAPTCHA ok na re-tentativa API.");
-            return;
-          }
-        }
-      }
-
+    } else {
       setJob(
         job,
         "solving-captcha",
-        `Ainda no captcha (${result.error || "retry"})…`,
+        `API falhou (${apiResult.error || "unknown"}). Abrindo puzzle + vision…`,
       );
-      await sleep(400);
+      await openCaptchaIfNeeded(page);
+    }
+  } else {
+    await openCaptchaIfNeeded(page);
+  }
+
+  while (Date.now() < deadline) {
+    if (await pageShowsActivationPending(page)) {
+      setJob(
+        job,
+        "pending_activation",
+        "CAPTCHA ok — tela de confirmação de e-mail aberta.",
+      );
+      return;
+    }
+    if (await isCaptchaVerified(page)) {
+      await dismissVerifiedCaptcha(page);
+      setJob(job, "filling-form", "CAPTCHA Verified — seguindo fluxo.");
+      return;
+    }
+    if (await pageLooksAuthenticated(page)) return;
+
+    const stillThere =
+      (await isAccessVerificationVisible(page)) ||
+      (await pageShowsAccessVerification(page)) ||
+      (await detectCaptcha(page));
+    if (!stillThere) {
+      await sleep(300);
+      if (
+        !(await isAccessVerificationVisible(page)) &&
+        !(await detectCaptcha(page))
+      ) {
+        setJob(job, "filling-form", "CAPTCHA/verificação sumiu.");
+        return;
+      }
     }
 
-    throw new Error(
-      "CAPTCHA atual não resolvido a tempo (API CDP + vision). Sem captcha ok o Qwen NÃO envia o e-mail de ativação.",
+    attemptRound += 1;
+
+    // Vision fallback — fewer attempts, faster loop.
+    if (
+      !(await page
+        .locator("#aliyunCaptcha-sliding-slider")
+        .first()
+        .isVisible()
+        .catch(() => false))
+    ) {
+      await openCaptchaIfNeeded(page);
+    }
+    const result = await solveAliyunPuzzleCaptcha(page, {
+      maxAttempts: 3,
+      onAttempt: ({ attempt, offsetPx, confidence, status }) => {
+        setJob(
+          job,
+          "solving-captcha",
+          `Vision r${attemptRound}.${attempt}: ${status}${
+            offsetPx != null ? ` · ${offsetPx}px` : ""
+          }${confidence != null ? ` · conf ${(confidence * 100).toFixed(0)}%` : ""}`,
+        );
+      },
+    });
+
+    if (result.ok) {
+      await sleep(300);
+      if (await isCaptchaVerified(page)) await dismissVerifiedCaptcha(page);
+      if (await pageShowsActivationPending(page)) {
+        setJob(
+          job,
+          "pending_activation",
+          `CAPTCHA ok em ${result.attempts} arraste(s).`,
+        );
+        return;
+      }
+      if (await pageLooksAuthenticated(page)) return;
+      if (
+        !(await isAccessVerificationVisible(page)) &&
+        !(await pageShowsAccessVerification(page))
+      ) {
+        setJob(
+          job,
+          "filling-form",
+          `CAPTCHA ok (offset=${result.offsetPx ?? "?"}px).`,
+        );
+        return;
+      }
+    }
+
+    // One API retry only if still stuck.
+    if (
+      cdpPort &&
+      config.accountCreator.captchaApiEnabled &&
+      triedApi &&
+      attemptRound <= 2
+    ) {
+      setJob(job, "solving-captcha", "Re-tentativa INSTANT da Captcha API…");
+      const apiRetry = await solveCaptchaViaApi({
+        cdpHost: config.accountCreator.cdpHost,
+        cdpPort,
+        targetUrl: "chat.qwen.ai",
+        timeoutMs: Math.min(20_000, Math.max(10_000, deadline - Date.now())),
+      });
+      if (apiRetry.ok) {
+        await sleep(300);
+        if (await isCaptchaVerified(page)) await dismissVerifiedCaptcha(page);
+        if (
+          (await pageShowsActivationPending(page)) ||
+          (await pageLooksAuthenticated(page)) ||
+          (!(await isAccessVerificationVisible(page)) &&
+            !(await pageShowsAccessVerification(page)))
+        ) {
+          setJob(job, "pending_activation", "CAPTCHA ok na re-tentativa API.");
+          return;
+        }
+      }
+    }
+
+    setJob(
+      job,
+      "solving-captcha",
+      `Ainda no captcha (${result.error || "retry"})…`,
     );
+    await sleep(300);
   }
+
+  throw new Error(
+    "CAPTCHA atual não resolvido a tempo (API CDP + vision). Sem captcha ok o Qwen NÃO envia o e-mail de ativação.",
+  );
+}
 
 /**
  * Real Qwen Studio auth form (2026):
@@ -1376,40 +1372,92 @@ async function openSignupAndFill(
 }
 
 async function ensureTermsAccepted(page: Page): Promise<void> {
-  // Prefer antd checkbox input
+  // NEVER click the "Termos de uso" / "Privacy" hyperlinks — that navigates to
+  // https://qwen.ai/termsservice and kills the signup form.
+  // Only toggle the checkbox itself.
+
+  // If we already left the form (terms page), go back immediately.
+  if (/qwen\.ai\/terms|termsservice|privacy/i.test(page.url())) {
+    await page.goBack({ waitUntil: "domcontentloaded" }).catch(async () => {
+      await page
+        .goto("https://chat.qwen.ai/auth?mode=register", {
+          waitUntil: "domcontentloaded",
+          timeout: 45_000,
+        })
+        .catch(() => {});
+    });
+    await sleep(800);
+  }
+
   const boxes = page.locator(
-    'input.ant-checkbox-input, input[type="checkbox"]',
+    'input.ant-checkbox-input, form input[type="checkbox"], .ant-checkbox input',
   );
   const count = await boxes.count().catch(() => 0);
-  for (let i = 0; i < Math.min(count, 4); i++) {
+  for (let i = 0; i < Math.min(count, 6); i++) {
     const box = boxes.nth(i);
-    if (!(await box.isVisible().catch(() => false))) continue;
+    // may be hidden (antd) — still force-check
     const checked = await box.isChecked().catch(() => false);
     if (checked) continue;
-    // Click wrapper/label first (antd intercepts)
-    const wrapper = page.locator(".ant-checkbox-wrapper, .ant-checkbox").nth(i);
-    if (await wrapper.isVisible().catch(() => false)) {
-      await wrapper.click({ timeout: 3_000 }).catch(() => {});
+
+    // Click the checkbox SPAN wrapper, not the text/link
+    const wrapper = box
+      .locator(
+        "xpath=ancestor::label[contains(@class,'ant-checkbox-wrapper')][1] | xpath=ancestor::span[contains(@class,'ant-checkbox')][1]",
+      )
+      .first();
+    if (await wrapper.count().catch(() => 0)) {
+      // Prefer the box icon, avoid any nested <a>
+      const icon = wrapper.locator(".ant-checkbox, .ant-checkbox-inner").first();
+      if (await icon.isVisible().catch(() => false)) {
+        await icon.click({ timeout: 2_000, force: true }).catch(() => {});
+      } else {
+        await wrapper.click({ timeout: 2_000, force: true, position: { x: 8, y: 8 } }).catch(() => {});
+      }
     }
+
     const still = await box.isChecked().catch(() => false);
     if (!still) {
       await box.check({ force: true }).catch(() => {});
-      await box.evaluate((el) => {
-        const input = el as HTMLInputElement;
-        input.checked = true;
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-        input.dispatchEvent(new Event("change", { bubbles: true }));
-        input.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      }).catch(() => {});
+      await box
+        .evaluate((el) => {
+          const input = el as HTMLInputElement;
+          input.checked = true;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+          // antd listens on the wrapper click too
+          const wrap = input.closest(".ant-checkbox-wrapper, label");
+          wrap?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        })
+        .catch(() => {});
     }
   }
 
-  // Text-based fallback near terms copy
-  const termsText = page
-    .getByText(/Estou de acordo|I agree|Termos de uso|Terms of (use|service)|Acordo de privacidade|Privacy/i)
+  // Text fallback: click only "Estou de acordo" label area, NEVER the terms link.
+  const agreeLabel = page
+    .locator("label, .ant-checkbox-wrapper, span")
+    .filter({ hasText: /Estou de acordo|I agree|I have read|Li e concordo/i })
     .first();
-  if (await termsText.isVisible().catch(() => false)) {
-    await termsText.click({ timeout: 3_000 }).catch(() => {});
+  if (await agreeLabel.isVisible().catch(() => false)) {
+    // Click left edge of the label (checkbox), not the link on the right
+    const box = await agreeLabel.boundingBox().catch(() => null);
+    if (box) {
+      await page.mouse.click(box.x + 10, box.y + box.height / 2).catch(() => {});
+    } else {
+      await agreeLabel.click({ timeout: 2_000, force: true, position: { x: 8, y: 8 } }).catch(() => {});
+    }
+  }
+
+  // If a terms tab/page still opened, close/back
+  if (/qwen\.ai\/terms|termsservice|privacy/i.test(page.url())) {
+    await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => {});
+  }
+  // Close extra pages that might have opened for terms
+  const pages = page.context().pages();
+  for (const p of pages) {
+    if (p === page) continue;
+    if (/termsservice|terms|privacy/i.test(p.url())) {
+      await p.close().catch(() => {});
+    }
   }
 }
 
@@ -1959,59 +2007,96 @@ async function runRegistration(
         signupStartedAt = Date.now();
         await openSignupAndFill(page, email, password, displayName);
 
-        // Post-submit loop: captcha / pending email / leave form.
-        // Do NOT fail immediately if still on form — re-submit after captcha attempts.
-        for (let round = 0; round < 3; round++) {
-          await sleep(1_200);
+                // If terms link stole navigation, recover immediately.
+                if (/qwen\.ai\/terms|termsservice|privacy/i.test(page.url())) {
+                  await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => {});
+                  await sleep(500);
+                }
 
-          if (await pageShowsActivationPending(page)) break;
-          if (await pageLooksAuthenticated(page)) break;
+                // Captcha often appears right after submit — fire solver with ZERO delay.
+                if (
+                  (await pageShowsAccessVerification(page)) ||
+                  (await detectCaptcha(page)) ||
+                  (await isCaptchaVerified(page))
+                ) {
+                  await handleCaptcha(
+                    page,
+                    job,
+                    Math.min(180_000, config.accountCreator.timeoutMs),
+                    cdpPort,
+                  );
+                }
 
-          if (
-            (await pageShowsAccessVerification(page)) ||
-            (await detectCaptcha(page)) ||
-            (await isCaptchaVerified(page))
-          ) {
-            await handleCaptcha(
-              page,
-              job,
-              Math.min(180_000, config.accountCreator.timeoutMs),
-              cdpPort,
-            );
-            // After captcha, form often auto-submits; wait a bit
-            await sleep(1_500);
-            if (await pageShowsActivationPending(page)) break;
-            if (await pageLooksAuthenticated(page)) break;
-          }
+                // Post-submit loop: captcha / pending email / leave form.
+                for (let round = 0; round < 3; round++) {
+                  // No artificial delay on first round — captcha must be instant.
+                  if (round > 0) await sleep(600);
 
-          const stillOnForm = await page
-            .locator(
-              'input[name="checkPassword"], button:has-text("Criar Conta"), button:has-text("Create Account")',
-            )
-            .first()
-            .isVisible()
-            .catch(() => false);
+                  if (await pageShowsActivationPending(page)) break;
+                  if (await pageLooksAuthenticated(page)) break;
 
-          if (!stillOnForm) break;
+                  // Recover if we got bounced to terms page
+                  if (/qwen\.ai\/terms|termsservice|privacy/i.test(page.url())) {
+                    await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => {});
+                    await sleep(400);
+                  }
 
-          // Still on form: re-accept terms + re-submit
-          setJob(
-            job,
-            "filling-form",
-            `Ainda na inscrição (rodada ${round + 1}/3) — reenviando formulário…`,
-          );
-          await ensureTermsAccepted(page);
-          await fillByName(page, "password", password).catch(() => {});
-          await fillByName(page, "checkPassword", password).catch(() => {});
-          await fillByName(page, "email", email).catch(() => {});
-          const submit = page
-            .locator(
-              'button[type="submit"], button:has-text("Criar Conta"), button:has-text("Create Account")',
-            )
-            .first();
-          await submit.click({ timeout: 8_000 }).catch(() => {});
-          await sleep(1_500);
-        }
+                  if (
+                    (await pageShowsAccessVerification(page)) ||
+                    (await detectCaptcha(page)) ||
+                    (await isCaptchaVerified(page))
+                  ) {
+                    await handleCaptcha(
+                      page,
+                      job,
+                      Math.min(180_000, config.accountCreator.timeoutMs),
+                      cdpPort,
+                    );
+                    if (await pageShowsActivationPending(page)) break;
+                    if (await pageLooksAuthenticated(page)) break;
+                  }
+
+                  const stillOnForm = await page
+                    .locator(
+                      'input[name="checkPassword"], button:has-text("Criar Conta"), button:has-text("Create Account")',
+                    )
+                    .first()
+                    .isVisible()
+                    .catch(() => false);
+
+                  if (!stillOnForm) break;
+
+                  // Still on form: re-accept terms + re-submit
+                  setJob(
+                    job,
+                    "filling-form",
+                    `Ainda na inscrição (rodada ${round + 1}/3) — reenviando formulário…`,
+                  );
+                  await ensureTermsAccepted(page);
+                  await fillByName(page, "password", password).catch(() => {});
+                  await fillByName(page, "checkPassword", password).catch(() => {});
+                  await fillByName(page, "email", email).catch(() => {});
+                  const submit = page
+                    .locator(
+                      'button[type="submit"], button:has-text("Criar Conta"), button:has-text("Create Account")',
+                    )
+                    .first();
+                  await submit.click({ timeout: 8_000 }).catch(() => {});
+                  // Captcha may appear instantly after click — don't sleep first.
+                  if (
+                    (await pageShowsAccessVerification(page)) ||
+                    (await detectCaptcha(page))
+                  ) {
+                    await handleCaptcha(
+                      page,
+                      job,
+                      Math.min(180_000, config.accountCreator.timeoutMs),
+                      cdpPort,
+                    );
+                  } else {
+                    await sleep(800);
+                  }
+                }
 
         // HARD GATE: do not claim "pending email" unless Qwen actually shows activation screen
         // or we are already authenticated. Headless often dies at Access Verification with no email sent.

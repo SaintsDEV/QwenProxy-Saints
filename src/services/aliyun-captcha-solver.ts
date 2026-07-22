@@ -108,38 +108,36 @@ export async function openCaptchaIfNeeded(page: Page): Promise<boolean> {
   ];
 
   for (const loc of starters) {
-    if (!(await loc.isVisible().catch(() => false))) continue;
-    await loc.scrollIntoViewIfNeeded().catch(() => {});
-    await loc.click({ timeout: 5_000, force: true }).catch(() => {});
-    await sleep(1_500);
-    // Puzzle may open in a floating window
-    let ready = await waitPuzzleReady(page, 10_000);
-    if (ready) return true;
-    // Second click sometimes needed
-    await loc.click({ timeout: 3_000, force: true }).catch(() => {});
-    ready = await waitPuzzleReady(page, 8_000);
-    if (ready) return true;
-  }
-
-  // Frame-based captcha (some Aliyun embeds)
-  for (const frame of page.frames()) {
-    try {
-      const btn = frame
-        .locator(
-          'text=/Click to start verification|Start verification|Iniciar verifica/i, #aliyunCaptcha-captcha-text',
-        )
-        .first();
-      if (await btn.isVisible().catch(() => false)) {
-        await btn.click({ timeout: 5_000 }).catch(() => {});
-        await sleep(1_500);
-      }
-    } catch {
-      // ignore frame errors
+      if (!(await loc.isVisible().catch(() => false))) continue;
+      await loc.scrollIntoViewIfNeeded().catch(() => {});
+      await loc.click({ timeout: 3_000, force: true }).catch(() => {});
+      // Faster readiness wait — API path doesn't need long sleeps
+      let ready = await waitPuzzleReady(page, 4_000);
+      if (ready) return true;
+      await loc.click({ timeout: 2_000, force: true }).catch(() => {});
+      ready = await waitPuzzleReady(page, 3_000);
+      if (ready) return true;
     }
-  }
 
-  return waitPuzzleReady(page, 6_000);
-}
+    // Frame-based captcha (some Aliyun embeds)
+    for (const frame of page.frames()) {
+      try {
+        const btn = frame
+          .locator(
+            'text=/Click to start verification|Start verification|Iniciar verifica/i, #aliyunCaptcha-captcha-text',
+          )
+          .first();
+        if (await btn.isVisible().catch(() => false)) {
+          await btn.click({ timeout: 3_000 }).catch(() => {});
+          await sleep(600);
+        }
+      } catch {
+        // ignore frame errors
+      }
+    }
+
+    return waitPuzzleReady(page, 3_000);
+  }
 
 /**
  * If the green "Verified" state is stuck, try to close/dismiss the modal so chat is usable.

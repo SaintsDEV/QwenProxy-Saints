@@ -270,8 +270,8 @@ export async function solveCaptchaViaApi(options: {
       options.gestureProfile || config.accountCreator.captchaGesture,
     reuseOpenCaptcha: true,
     openIfNeeded: true,
-    waitForReadyMs: 12_000,
-    waitForPuzzleTimeoutMs: 12_000,
+    waitForReadyMs: 8_000,
+    waitForPuzzleTimeoutMs: 8_000,
     verbose: false,
     debugScreenshots: false,
   };
@@ -325,7 +325,7 @@ export async function solveCaptchaViaApi(options: {
         error: job.data?.error?.message || "captcha infra error",
       };
     }
-    await sleep(400);
+    await sleep(250);
   }
   return {
     ok: false,
