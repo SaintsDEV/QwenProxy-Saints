@@ -971,11 +971,10 @@ async function handleCaptcha(
 
 /**
  * Real Qwen Studio auth form (2026):
- * Login: input[name=email] type=text, input[name=password], "Inscrever-se"
- * Signup: username, email (type=text), password, checkPassword, terms checkbox, "Criar Conta"
+ * Landing often shows chat shell + top-right "Fazer login" / "Inscrever-se".
+ * The real form only mounts AFTER clicking Inscrever-se (or /auth routes).
  *
- * IMPORTANT: ?mode=register in the URL alone does NOT mean the form is mounted.
- * The SPA often boots on chat shell / login first — we must wait for real fields.
+ * Never rely on bare /?mode=register — Qwen redirects there to the chat shell.
  */
 async function openSignupAndFill(
   page: Page,
@@ -1004,63 +1003,60 @@ async function openSignupAndFill(
       'button:has-text("Criar Conta")',
       'button:has-text("Create Account")',
       'button:has-text("Sign up")',
-      'text=/Inscreva-se no Qwen|Create your account|Criar conta/i',
+      'text=/Inscreva-se no Qwen|Create your account|Criar Conta/i',
     ].join(", "),
   );
 
   async function dismissBlockingUi(): Promise<void> {
-    // Cookie / consent / region banners that block the auth form
-    const dismissTexts = [
-      "Accept",
-      "Aceitar",
-      "I agree",
-      "Concordo",
-      "OK",
-      "Got it",
-      "Entendi",
-      "Allow all",
-      "Permitir",
-      "Close",
-      "Fechar",
+    // Chrome upgrade / cookie / consent banners
+    const dismissers = [
+      page.locator('button[aria-label*="close" i], button[aria-label*="fechar" i]').first(),
+      page.getByRole("button", { name: /^×$|^x$/i }).first(),
+      page.getByRole("button", {
+        name: /^(Accept|Aceitar|I agree|Concordo|OK|Got it|Entendi|Allow all|Permitir|Close|Fechar)$/i,
+      }).first(),
     ];
-    for (const t of dismissTexts) {
-      const b = page.getByRole("button", { name: new RegExp(`^${t}$`, "i") }).first();
+    for (const b of dismissers) {
       if (await b.isVisible().catch(() => false)) {
-        await b.click({ timeout: 2_000 }).catch(() => {});
+        await b.click({ timeout: 1_500 }).catch(() => {});
       }
     }
-    // Escape any modal
     await page.keyboard.press("Escape").catch(() => {});
   }
 
-  async function tryOpenSignupFromLogin(): Promise<void> {
+  async function clickInscreverSe(): Promise<boolean> {
+    // Exact top-right CTA seen on chat shell: "Inscrever-se" / "Fazer login"
+    const candidates = [
+      page.getByRole("button", { name: /^Inscrever-se$/i }).first(),
+      page.getByRole("link", { name: /^Inscrever-se$/i }).first(),
+      page.getByRole("button", { name: /Inscrever-se|Inscreva-se|Sign up|Create account/i }).first(),
+      page.getByRole("link", { name: /Inscrever-se|Inscreva-se|Sign up|Create account/i }).first(),
+      page.locator('a, button, [role="button"]').filter({
+        hasText: /^(Inscrever-se|Inscreva-se|Sign up|Create account)$/i,
+      }).first(),
+      page.locator('header a, header button, nav a, nav button').filter({
+        hasText: /Inscrever-se|Sign up/i,
+      }).first(),
+    ];
+    for (const loc of candidates) {
+      if (!(await loc.isVisible().catch(() => false))) continue;
+      await loc.scrollIntoViewIfNeeded().catch(() => {});
+      await loc.click({ timeout: 5_000, force: true }).catch(() => {});
+      await sleep(1_200);
+      if (await pageHasSignupForm()) return true;
+      if (await pageHasAnyAuthField()) return true;
+    }
+    // Fallback text click
     await clickByText(page, [
       "Inscrever-se",
       "Inscreva-se",
-      "Inscrever",
       "Sign up",
       "Create account",
       "Cadastrar",
       "Registrar",
-      "Criar conta",
     ]);
-    // Role-based (antd buttons sometimes don't match getByText cleanly)
-    const roleBtn = page
-      .getByRole("button", {
-        name: /inscrever|sign up|create account|cadastrar|registrar/i,
-      })
-      .first();
-    if (await roleBtn.isVisible().catch(() => false)) {
-      await roleBtn.click({ timeout: 5_000 }).catch(() => {});
-    }
-    const link = page
-      .getByRole("link", {
-        name: /inscrever|sign up|create account|cadastrar|registrar/i,
-      })
-      .first();
-    if (await link.isVisible().catch(() => false)) {
-      await link.click({ timeout: 5_000 }).catch(() => {});
-    }
+    await sleep(1_000);
+    return (await pageHasSignupForm()) || (await pageHasAnyAuthField());
   }
 
   async function pageHasSignupForm(): Promise<boolean> {
@@ -1071,73 +1067,119 @@ async function openSignupAndFill(
     return fieldLocator.first().isVisible().catch(() => false);
   }
 
-  // Canonical signup URL (NOT bare /?mode=register — that lands on chat shell).
-    const entryUrls = [
-      "https://chat.qwen.ai/auth?mode=register",
-      "https://chat.qwen.ai/auth?tab=signup",
-      "https://chat.qwen.ai/auth",
-    ];
+  async function isChatShellLanding(): Promise<boolean> {
+    const url = page.url();
+    // Bare / or /?mode=register without /auth = chat shell, not form
+    if (/chat\.qwen\.ai\/(?:\?|$)/i.test(url) && !/\/auth/i.test(url)) {
+      return true;
+    }
+    // UI markers from the screenshot
+    const shell = page.locator(
+      [
+        'button:has-text("Fazer login")',
+        'button:has-text("Inscrever-se")',
+        'a:has-text("Fazer login")',
+        'a:has-text("Inscrever-se")',
+        'text=/Qual é o teu foco hoje|Como posso ajudá-lo hoje|O que está na agenda/i',
+      ].join(", "),
+    );
+    return shell.first().isVisible().catch(() => false);
+  }
 
-  let lastDiag = "";
-  for (let round = 0; round < entryUrls.length; round++) {
-    const url = entryUrls[round];
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
-    await sleep(1_800);
-    await dismissBlockingUi();
+  async function wipeQwenSession(): Promise<void> {
+    await page.context().clearCookies().catch(() => {});
+    await page
+      .evaluate(() => {
+        try {
+          localStorage.clear();
+          sessionStorage.clear();
+        } catch {
+          /* ignore */
+        }
+      })
+      .catch(() => {});
+  }
 
-    // If already logged in from a sticky profile, force logout path
-    const alreadyChat =
-      (await pageLooksAuthenticated(page)) &&
-      !(await pageHasAnyAuthField());
-    if (alreadyChat) {
-      // Clear site storage so the auth form can appear
+  async function ensureOnAuthRoute(): Promise<void> {
+    // If SPA redirected to chat shell, leave it immediately.
+    if (await isChatShellLanding()) {
       await page
-        .context()
-        .clearCookies()
-        .catch(() => {});
-      await page
-        .evaluate(() => {
-          try {
-            localStorage.clear();
-            sessionStorage.clear();
-          } catch {
-            /* ignore */
-          }
+        .goto("https://chat.qwen.ai/auth?mode=register", {
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
         })
         .catch(() => {});
+      await sleep(1_000);
+    }
+    // Still shell? click Inscrever-se on the landing.
+    if (await isChatShellLanding()) {
+      await clickInscreverSe();
+      await sleep(1_000);
+    }
+    // Still not on /auth with fields? hard navigate again.
+    if (!(await pageHasAnyAuthField()) && !(await pageHasSignupForm())) {
       await page
         .goto("https://chat.qwen.ai/auth", {
           waitUntil: "domcontentloaded",
           timeout: 60_000,
         })
         .catch(() => {});
-      await sleep(1_500);
-      await dismissBlockingUi();
+      await sleep(1_200);
+    }
+  }
+
+  // Start clean — sticky guest session often forces chat shell.
+  await wipeQwenSession();
+
+  const entryUrls = [
+    "https://chat.qwen.ai/auth?mode=register",
+    "https://chat.qwen.ai/auth",
+    "https://chat.qwen.ai/auth?tab=signup",
+  ];
+
+  let lastDiag = "";
+  for (let round = 0; round < entryUrls.length; round++) {
+    const url = entryUrls[round];
+    await page
+      .goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 })
+      .catch(() => {});
+    await sleep(1_200);
+    await dismissBlockingUi();
+
+    // Qwen often redirects /auth?mode=register → /?mode=register (chat shell).
+    await ensureOnAuthRoute();
+    await dismissBlockingUi();
+
+    // Prefer clicking Inscrever-se whenever the top CTA is visible.
+    if (!(await pageHasSignupForm())) {
+      await clickInscreverSe();
     }
 
-    // Wait a bit for SPA hydrate
-    for (let i = 0; i < 8; i++) {
+    // Wait for SPA hydrate / modal form
+    for (let i = 0; i < 10; i++) {
       if (await pageHasSignupForm()) break;
-      if (await pageHasAnyAuthField()) {
+      if (await isChatShellLanding()) {
+        await clickInscreverSe();
+      } else if (await pageHasAnyAuthField()) {
         // Login form — switch to signup
-        await tryOpenSignupFromLogin();
-        await sleep(1_000);
-        if (await pageHasSignupForm()) break;
+        await clickInscreverSe();
       }
       await dismissBlockingUi();
-      await sleep(800);
+      await sleep(700);
     }
 
     if (await pageHasSignupForm()) break;
     if (await pageHasAnyAuthField()) {
-      await tryOpenSignupFromLogin();
-      await sleep(1_200);
+      await clickInscreverSe();
+      await sleep(1_000);
       if (await pageHasSignupForm()) break;
     }
 
     lastDiag = await page
       .evaluate(() => {
-        const body = (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 220);
+        const body = (document.body?.innerText || "")
+          .replace(/\s+/g, " ")
+          .slice(0, 220);
         const inputs = Array.from(document.querySelectorAll("input"))
           .slice(0, 8)
           .map((el) => {
@@ -1145,12 +1187,32 @@ async function openSignupAndFill(
             return `${i.type}|name=${i.name}|ph=${i.placeholder}|vis=${i.offsetParent !== null}`;
           })
           .join("; ");
-        return `url=${location.href} | inputs=[${inputs}] | body=${body}`;
+        const btns = Array.from(
+          document.querySelectorAll("button, a[role='button'], a"),
+        )
+          .slice(0, 12)
+          .map((el) => (el.textContent || "").trim().slice(0, 40))
+          .filter(Boolean)
+          .join(" | ");
+        return `url=${location.href} | inputs=[${inputs}] | btns=[${btns}] | body=${body}`;
       })
       .catch(() => `url=${page.url()}`);
   }
 
-  // Final wait for ANY auth field, then ensure signup
+  // Final: if still chat shell, one more hard path
+  if (!(await pageHasSignupForm()) && !(await pageHasAnyAuthField())) {
+    await wipeQwenSession();
+    await page
+      .goto("https://chat.qwen.ai/auth?mode=register", {
+        waitUntil: "networkidle",
+        timeout: 60_000,
+      })
+      .catch(() => {});
+    await sleep(1_500);
+    await ensureOnAuthRoute();
+    await clickInscreverSe();
+  }
+
   const fieldVisible = await fieldLocator
     .first()
     .waitFor({ state: "visible", timeout: 20_000 })
@@ -1166,12 +1228,12 @@ async function openSignupAndFill(
         )
         .catch(() => page.url()));
     throw new Error(
-      `Formulário de inscrição do Qwen não apareceu (timeout). ${diag}`,
+      `Formulário de inscrição do Qwen não apareceu (timeout). Clique em Inscrever-se falhou? ${diag}`,
     );
   }
 
   if (!(await pageHasSignupForm())) {
-    await tryOpenSignupFromLogin();
+    await clickInscreverSe();
     await sleep(1_200);
   }
 
@@ -1182,20 +1244,20 @@ async function openSignupAndFill(
     .then(() => true)
     .catch(() => false);
   if (!signupReady) {
-      // Still only login? force the real register route under /auth
-      await page
-        .goto("https://chat.qwen.ai/auth?mode=register", {
-          waitUntil: "domcontentloaded",
-          timeout: 45_000,
-        })
-        .catch(() => {});
-      await sleep(1_500);
-      await tryOpenSignupFromLogin();
-      await signupMarkers
-        .first()
-        .waitFor({ state: "visible", timeout: 12_000 })
-        .catch(() => {});
-    }
+    await page
+      .goto("https://chat.qwen.ai/auth?mode=register", {
+        waitUntil: "domcontentloaded",
+        timeout: 45_000,
+      })
+      .catch(() => {});
+    await sleep(1_200);
+    await ensureOnAuthRoute();
+    await clickInscreverSe();
+    await signupMarkers
+      .first()
+      .waitFor({ state: "visible", timeout: 12_000 })
+      .catch(() => {});
+  }
 
   // Username: keep simple (no accents/spaces that sometimes fail validation)
   const safeName =
@@ -1257,7 +1319,7 @@ async function openSignupAndFill(
   // Accept terms checkbox (required — submit stays disabled otherwise)
   await ensureTermsAccepted(page);
 
-  await sleep(500);
+  await sleep(400);
 
   // Some Qwen locales show an inline Aliyun trigger before submit
   const captchaTrigger = page
@@ -1267,7 +1329,7 @@ async function openSignupAndFill(
     .first();
   if (await captchaTrigger.isVisible().catch(() => false)) {
     await captchaTrigger.click().catch(() => {});
-    await sleep(800);
+    await sleep(600);
   }
 
   // Submit — ensure button is enabled
@@ -1279,7 +1341,6 @@ async function openSignupAndFill(
 
   for (let attempt = 0; attempt < 4; attempt++) {
     await ensureTermsAccepted(page);
-    // Re-fill password fields if React cleared them
     await fillByName(page, "password", password).catch(() => {});
     await fillByName(page, "checkPassword", password).catch(() => {});
 
@@ -1289,14 +1350,13 @@ async function openSignupAndFill(
       (await submit.getAttribute("aria-disabled").catch(() => null)) === "true";
     if (disabled) {
       await ensureTermsAccepted(page);
-      await sleep(400);
+      await sleep(300);
     }
 
     await submit.click({ timeout: 10_000 }).catch(async () => {
       await clickByText(page, ["Criar Conta", "Create Account", "Sign up"]);
     });
 
-    // Wait for captcha modal OR activation screen OR leave form
     for (let i = 0; i < 10; i++) {
       if (await pageShowsAccessVerification(page)) return;
       if (await detectCaptcha(page)) return;
@@ -1310,7 +1370,7 @@ async function openSignupAndFill(
         .isVisible()
         .catch(() => false);
       if (!stillForm) return;
-      await sleep(600);
+      await sleep(500);
     }
   }
 }
