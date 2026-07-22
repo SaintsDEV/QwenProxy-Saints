@@ -1,0 +1,16 @@
+services:
+  qwenbridge:
+    build: .
+    container_name: qwenbridge
+    ports:
+      - "${PORT:-3000}:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
