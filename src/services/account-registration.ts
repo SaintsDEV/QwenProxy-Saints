@@ -981,6 +981,9 @@ async function handleCaptcha(
  * Real Qwen Studio auth form (2026):
  * Login: input[name=email] type=text, input[name=password], "Inscrever-se"
  * Signup: username, email (type=text), password, checkPassword, terms checkbox, "Criar Conta"
+ *
+ * IMPORTANT: ?mode=register in the URL alone does NOT mean the form is mounted.
+ * The SPA often boots on chat shell / login first — we must wait for real fields.
  */
 async function openSignupAndFill(
   page: Page,
@@ -988,58 +991,219 @@ async function openSignupAndFill(
   password: string,
   displayName: string,
 ): Promise<void> {
-  // Prefer explicit register mode (seen in live URLs)
-  await page.goto("https://chat.qwen.ai/?mode=register", {
-    waitUntil: "domcontentloaded",
-    timeout: 60_000,
-  });
-  await sleep(1_500);
+  const fieldLocator = page.locator(
+    [
+      'input[name="email"]',
+      'input[name="username"]',
+      'input[name="checkPassword"]',
+      'input[type="email"]',
+      'input[placeholder*="E-mail" i]',
+      'input[placeholder*="Email" i]',
+      'input[placeholder*="e-mail" i]',
+      'input[autocomplete="email"]',
+      'input[autocomplete="username"]',
+    ].join(", "),
+  );
 
-  // If we landed on login, switch to signup
-  const onSignup =
-    (await page
-      .locator(
-        'input[name="checkPassword"], input[name="username"], button:has-text("Criar Conta"), button:has-text("Create Account")',
-      )
-      .first()
-      .isVisible()
-      .catch(() => false)) || /mode=register|signup|register/i.test(page.url());
+  const signupMarkers = page.locator(
+    [
+      'input[name="checkPassword"]',
+      'input[name="username"]',
+      'button:has-text("Criar Conta")',
+      'button:has-text("Create Account")',
+      'button:has-text("Sign up")',
+      'text=/Inscreva-se no Qwen|Create your account|Criar conta/i',
+    ].join(", "),
+  );
 
-  if (!onSignup) {
-    const switched =
-      (await clickByText(page, [
-        "Inscrever-se",
-        "Inscreva-se",
-        "Inscrever",
-        "Sign up",
-        "Create account",
-        "Cadastrar",
-        "Registrar",
-      ])) || false;
-    if (!switched) {
-      await page
-        .goto("https://chat.qwen.ai/auth?tab=signup", {
-          waitUntil: "domcontentloaded",
-          timeout: 30_000,
-        })
-        .catch(() => {});
-      await page
-        .goto("https://chat.qwen.ai/?mode=register", {
-          waitUntil: "domcontentloaded",
-          timeout: 30_000,
-        })
-        .catch(() => {});
+  async function dismissBlockingUi(): Promise<void> {
+    // Cookie / consent / region banners that block the auth form
+    const dismissTexts = [
+      "Accept",
+      "Aceitar",
+      "I agree",
+      "Concordo",
+      "OK",
+      "Got it",
+      "Entendi",
+      "Allow all",
+      "Permitir",
+      "Close",
+      "Fechar",
+    ];
+    for (const t of dismissTexts) {
+      const b = page.getByRole("button", { name: new RegExp(`^${t}$`, "i") }).first();
+      if (await b.isVisible().catch(() => false)) {
+        await b.click({ timeout: 2_000 }).catch(() => {});
+      }
     }
+    // Escape any modal
+    await page.keyboard.press("Escape").catch(() => {});
+  }
+
+  async function tryOpenSignupFromLogin(): Promise<void> {
+    await clickByText(page, [
+      "Inscrever-se",
+      "Inscreva-se",
+      "Inscrever",
+      "Sign up",
+      "Create account",
+      "Cadastrar",
+      "Registrar",
+      "Criar conta",
+    ]);
+    // Role-based (antd buttons sometimes don't match getByText cleanly)
+    const roleBtn = page
+      .getByRole("button", {
+        name: /inscrever|sign up|create account|cadastrar|registrar/i,
+      })
+      .first();
+    if (await roleBtn.isVisible().catch(() => false)) {
+      await roleBtn.click({ timeout: 5_000 }).catch(() => {});
+    }
+    const link = page
+      .getByRole("link", {
+        name: /inscrever|sign up|create account|cadastrar|registrar/i,
+      })
+      .first();
+    if (await link.isVisible().catch(() => false)) {
+      await link.click({ timeout: 5_000 }).catch(() => {});
+    }
+  }
+
+  async function pageHasSignupForm(): Promise<boolean> {
+    return signupMarkers.first().isVisible().catch(() => false);
+  }
+
+  async function pageHasAnyAuthField(): Promise<boolean> {
+    return fieldLocator.first().isVisible().catch(() => false);
+  }
+
+  const entryUrls = [
+    "https://chat.qwen.ai/auth",
+    "https://chat.qwen.ai/?mode=register",
+    "https://chat.qwen.ai/auth?tab=signup",
+    "https://chat.qwen.ai/auth?mode=register",
+  ];
+
+  let lastDiag = "";
+  for (let round = 0; round < entryUrls.length; round++) {
+    const url = entryUrls[round];
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+    await sleep(1_800);
+    await dismissBlockingUi();
+
+    // If already logged in from a sticky profile, force logout path
+    const alreadyChat =
+      (await pageLooksAuthenticated(page)) &&
+      !(await pageHasAnyAuthField());
+    if (alreadyChat) {
+      // Clear site storage so the auth form can appear
+      await page
+        .context()
+        .clearCookies()
+        .catch(() => {});
+      await page
+        .evaluate(() => {
+          try {
+            localStorage.clear();
+            sessionStorage.clear();
+          } catch {
+            /* ignore */
+          }
+        })
+        .catch(() => {});
+      await page
+        .goto("https://chat.qwen.ai/auth", {
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
+        })
+        .catch(() => {});
+      await sleep(1_500);
+      await dismissBlockingUi();
+    }
+
+    // Wait a bit for SPA hydrate
+    for (let i = 0; i < 8; i++) {
+      if (await pageHasSignupForm()) break;
+      if (await pageHasAnyAuthField()) {
+        // Login form — switch to signup
+        await tryOpenSignupFromLogin();
+        await sleep(1_000);
+        if (await pageHasSignupForm()) break;
+      }
+      await dismissBlockingUi();
+      await sleep(800);
+    }
+
+    if (await pageHasSignupForm()) break;
+    if (await pageHasAnyAuthField()) {
+      await tryOpenSignupFromLogin();
+      await sleep(1_200);
+      if (await pageHasSignupForm()) break;
+    }
+
+    lastDiag = await page
+      .evaluate(() => {
+        const body = (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 220);
+        const inputs = Array.from(document.querySelectorAll("input"))
+          .slice(0, 8)
+          .map((el) => {
+            const i = el as HTMLInputElement;
+            return `${i.type}|name=${i.name}|ph=${i.placeholder}|vis=${i.offsetParent !== null}`;
+          })
+          .join("; ");
+        return `url=${location.href} | inputs=[${inputs}] | body=${body}`;
+      })
+      .catch(() => `url=${page.url()}`);
+  }
+
+  // Final wait for ANY auth field, then ensure signup
+  const fieldVisible = await fieldLocator
+    .first()
+    .waitFor({ state: "visible", timeout: 20_000 })
+    .then(() => true)
+    .catch(() => false);
+
+  if (!fieldVisible) {
+    const diag =
+      lastDiag ||
+      (await page
+        .evaluate(() =>
+          (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 280),
+        )
+        .catch(() => page.url()));
+    throw new Error(
+      `Formulário de inscrição do Qwen não apareceu (timeout). ${diag}`,
+    );
+  }
+
+  if (!(await pageHasSignupForm())) {
+    await tryOpenSignupFromLogin();
     await sleep(1_200);
   }
 
-  // Wait for signup fields
-  await page
-    .locator(
-      'input[name="email"], input[name="username"], input[placeholder*="E-mail" i], input[placeholder*="Email" i]',
-    )
+  // Wait specifically for signup markers (checkPassword / Criar Conta)
+  const signupReady = await signupMarkers
     .first()
-    .waitFor({ state: "visible", timeout: 25_000 });
+    .waitFor({ state: "visible", timeout: 15_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!signupReady) {
+    // Still only login? one more forced navigation
+    await page
+      .goto("https://chat.qwen.ai/?mode=register", {
+        waitUntil: "domcontentloaded",
+        timeout: 45_000,
+      })
+      .catch(() => {});
+    await sleep(1_500);
+    await tryOpenSignupFromLogin();
+    await signupMarkers
+      .first()
+      .waitFor({ state: "visible", timeout: 12_000 })
+      .catch(() => {});
+  }
 
   // Username: keep simple (no accents/spaces that sometimes fail validation)
   const safeName =
@@ -1058,7 +1222,7 @@ async function openSignupAndFill(
   if (!emailOk) {
     const emailAlt = page
       .locator(
-        'input[placeholder*="E-mail" i], input[placeholder*="Email" i], input[name="email"], input[type="email"]',
+        'input[placeholder*="E-mail" i], input[placeholder*="Email" i], input[name="email"], input[type="email"], input[autocomplete="email"]',
       )
       .first();
     if (await emailAlt.count()) {
@@ -1081,7 +1245,7 @@ async function openSignupAndFill(
   }
   if (!passOk) {
     const passAlt = page.locator('input[type="password"]').first();
-    await passAlt.fill(password);
+    if (await passAlt.count()) await passAlt.fill(password);
   }
   if (!checkOk) {
     const pws = page.locator('input[type="password"]');
@@ -1090,7 +1254,7 @@ async function openSignupAndFill(
   if (!nameOk) {
     const userAlt = page
       .locator(
-        'input[name="username"], input[placeholder*="nome" i], input[placeholder*="user" i]',
+        'input[name="username"], input[placeholder*="nome" i], input[placeholder*="user" i], input[autocomplete="username"]',
       )
       .first();
     if (await userAlt.count()) {
